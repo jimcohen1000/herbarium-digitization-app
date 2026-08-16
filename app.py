@@ -33,6 +33,7 @@ if "out_dir" not in st.session_state:
     st.session_state.out_dir = tempfile.mkdtemp()
 
 default_fields = {
+    "catalogNumber": "",
     "scientificName": "",
     "recordedBy": "",
     "recordNumber": "",
@@ -58,7 +59,7 @@ api_key = st.sidebar.text_input(
     "Gemini API Key (Free from AI Studio)",
     type="password",
     value=st.secrets.get("GEMINI_API_KEY", ""),
-    help="Get a free key at https://aistudio.google.com/ - No credit card required.",
+    help="Default key is loaded from secrets if available. Clear and type to override.",
 )
 
 
@@ -107,17 +108,22 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
 
 # Vision API Label Parser using official google-genai SDK
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Google GenAI SDK to structure label data directly into Symbiota JSON fields."""
+    """Uses Google GenAI SDK to structure label and barcode data directly into Symbiota JSON fields."""
     try:
         client = genai.Client(api_key=key)
 
-        # Active production models
-        candidate_models = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
+        candidate_models = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-2.5-flash",
+        ]
 
         prompt = """
-        Examine this herbarium specimen sheet. Locate the primary specimen label and extract the data into Symbiota/Darwin Core fields.
+        Examine this herbarium specimen sheet. Locate the primary specimen label and any barcode or catalog stickers.
+        Extract the data into Symbiota/Darwin Core fields.
         Return ONLY a JSON object matching this schema:
         {
+            "catalogNumber": "Extracted barcode or catalog ID number",
             "scientificName": "Full genus species infraspecies",
             "recordedBy": "Collector name(s)",
             "recordNumber": "Collector number",
@@ -154,6 +160,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         res = default_fields.copy()
         res["verbatimLabel"] = f"API Error: {str(e)}"
         return res
+
 
 # Sidebar: Upload Batch
 st.sidebar.header("3. Upload Batch")
@@ -240,9 +247,15 @@ if st.session_state.image_paths:
 
         # Right Column: Data Fields
         with col2:
+            pf = st.session_state.parsed_fields
+
             st.markdown("#### 1. Barcode Identification")
 
+            # Fallback Logic: Try local OpenCV/ZXing decoder first; if empty, use AI extracted catalogNumber
             auto_code = decode_barcode_fullres(image)
+            if not auto_code and pf.get("catalogNumber"):
+                auto_code = pf.get("catalogNumber")
+
             cat_num = st.text_input("Catalog Number (Barcode)", value=auto_code)
 
             if st.button("Read Barcode from Blue Crop Box"):
@@ -269,8 +282,7 @@ if st.session_state.image_paths:
                         st.session_state.parsed_fields = run_gemini_parser(
                             image, api_key
                         )
-
-            pf = st.session_state.parsed_fields
+                        st.rerun()
 
             # Form Input Boxes
             sci_name = st.text_input(
