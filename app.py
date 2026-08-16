@@ -1,5 +1,7 @@
 import io
+import json
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -20,7 +22,7 @@ st.set_page_config(
 st.title("Herbarium Image-First Databasing Tool")
 
 
-# Cache EasyOCR model in memory so it loads once at startup
+# Cache EasyOCR model in memory
 @st.cache_resource
 def load_easyocr_reader():
     return easyocr.Reader(["en"], gpu=False)
@@ -39,8 +41,23 @@ if "work_dir" not in st.session_state:
     st.session_state.work_dir = tempfile.mkdtemp()
 if "out_dir" not in st.session_state:
     st.session_state.out_dir = tempfile.mkdtemp()
-if "ocr_text" not in st.session_state:
-    st.session_state.ocr_text = ""
+
+# Parsed Field State Buffer
+default_fields = {
+    "scientificName": "",
+    "recordedBy": "",
+    "recordNumber": "",
+    "eventDate": "",
+    "country": "USA",
+    "stateProvince": "",
+    "county": "",
+    "locality": "",
+    "habitat": "",
+    "verbatimLabel": "",
+}
+
+if "parsed_fields" not in st.session_state:
+    st.session_state.parsed_fields = default_fields.copy()
 
 # Sidebar: Institutional Settings
 st.sidebar.header("1. Institutional Defaults")
@@ -54,12 +71,12 @@ ocr_engine = st.sidebar.radio(
     [
         "EasyOCR (Deep Learning - Crop)",
         "Tesseract (Local Crop - Free)",
-        "Gemini AI (Full Sheet Auto-Detect)",
+        "Gemini AI (Full Sheet Auto-Parse)",
     ],
 )
 
 api_key = ""
-if ocr_engine == "Gemini AI (Full Sheet Auto-Detect)":
+if ocr_engine == "Gemini AI (Full Sheet Auto-Parse)":
     api_key = st.sidebar.text_input(
         "Gemini API Key (Personal Account)",
         type="password",
@@ -70,12 +87,10 @@ if ocr_engine == "Gemini AI (Full Sheet Auto-Detect)":
 # Helper Functions
 def decode_barcode_advanced(img: Image.Image) -> str:
     """Multi-angle, dual-engine (zxing-cpp + pyzbar) barcode reader with padding."""
-    # Add white margin (Quiet Zone) required for barcode decoding
     img_padded = ImageOps.expand(img, border=30, fill="white")
     gray = img_padded.convert("L")
     contrast = ImageEnhance.Contrast(gray).enhance(2.5)
 
-    # Test across 4 rotations (0°, 90°, 180°, 270°)
     for angle in [0, 90, 180, 270]:
         rotated_img = (
             img_padded if angle == 0 else img_padded.rotate(angle, expand=True)
@@ -84,7 +99,6 @@ def decode_barcode_advanced(img: Image.Image) -> str:
             contrast if angle == 0 else contrast.rotate(angle, expand=True)
         )
 
-        # Primary Engine: ZXing-CPP
         try:
             results = zxingcpp.read_barcodes(rotated_img)
             if results and results[0].text:
@@ -92,7 +106,6 @@ def decode_barcode_advanced(img: Image.Image) -> str:
         except Exception:
             pass
 
-        # Fallback Engine: PyZBar
         try:
             barcodes = decode(rotated_contrast)
             if barcodes:
@@ -103,26 +116,87 @@ def decode_barcode_advanced(img: Image.Image) -> str:
     return ""
 
 
-def run_easyocr(cropped_img: Image.Image) -> str:
-    img_np = np.array(cropped_img)
-    results = reader.readtext(img_np, detail=0)
-    return " ".join(results)
+def parse_label_heuristics(text: str) -> dict:
+    """Extracts common Symbiota fields from text using pattern matching."""
+    parsed = default_fields.copy()
+    parsed["verbatimLabel"] = text
+
+    if not text:
+        return parsed
+
+    # Scientific Name (Latin Binomial heuristic: Genus species)
+    sci_match = re.search(
+        r"\b([A-Z][a-z]{2,}\s+[a-z]{2,}(?:\s+(?:var\.|subsp\.|f\.)\s+[a-z]{2,})?)\b",
+        text,
+    )
+    if sci_match:
+        parsed["scientificName"] = sci_match.group(1)
+
+    # Date
+    date_match = re.search(
+        r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if date_match:
+        parsed["eventDate"] = date_match.group(0)
+
+    # Collector
+    coll_match = re.search(
+        r"(?:Coll(?:ector)?s?|Leg)\.?:?\s*([A-Z][a-zA-Z\.\s,]+?)(?=\s+\d|\n|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if coll_match:
+        parsed["recordedBy"] = coll_match.group(1).strip()
+
+    # Collector Number
+    num_match = re.search(
+        r"(?:No\.|#|Num\.?)\s*(\d+[A-Za-z]?)", text, re.IGNORECASE
+    )
+    if num_match:
+        parsed["recordNumber"] = num_match.group(1)
+
+    # County
+    county_match = re.search(
+        r"([A-Z][a-zA-Z\s]+?)\s+Co(?:unty)?\b", text, re.IGNORECASE
+    )
+    if county_match:
+        parsed["county"] = county_match.group(1).strip() + " County"
+
+    return parsed
 
 
-def run_tesseract_ocr(cropped_img: Image.Image) -> str:
-    raw_ocr = pytesseract.image_to_string(cropped_img)
-    return " ".join(raw_ocr.split())
-
-
-def run_gemini_ocr(img: Image.Image, key: str) -> str:
+def run_gemini_parser(img: Image.Image, key: str) -> dict:
+    """Uses Gemini API to directly extract and parse Symbiota fields as structured JSON."""
     try:
         genai.configure(api_key=key)
         model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = "Extract all text from the specimen label in this herbarium sheet image. Return only verbatim label text."
-        response = model.generate_content([prompt, img])
-        return response.text.strip()
+        prompt = """
+        Extract all text from the specimen label in this image and parse it into Symbiota / Darwin Core fields.
+        Return ONLY a JSON object matching this schema:
+        {
+            "scientificName": "Genus species infraspecies",
+            "recordedBy": "Collector name(s)",
+            "recordNumber": "Collector number",
+            "eventDate": "Collection date",
+            "country": "Country",
+            "stateProvince": "State or Province",
+            "county": "County",
+            "locality": "Detailed locality description",
+            "habitat": "Habitat or substrate notes",
+            "verbatimLabel": "Exact verbatim text on label"
+        }
+        """
+        response = model.generate_content(
+            [prompt, img],
+            generation_config={"response_mime_type": "application/json"},
+        )
+        return json.loads(response.text)
     except Exception as e:
-        return f"Gemini Error: {str(e)}"
+        res = default_fields.copy()
+        res["verbatimLabel"] = f"Gemini Error: {str(e)}"
+        return res
 
 
 # Sidebar: Upload Batch
@@ -172,12 +246,12 @@ if st.session_state.image_paths:
         with nav_col2:
             if st.button("⬅️ Previous") and st.session_state.idx > 0:
                 st.session_state.idx -= 1
-                st.session_state.ocr_text = ""
+                st.session_state.parsed_fields = default_fields.copy()
                 st.rerun()
         with nav_col3:
             if st.button("⏭️ Skip"):
                 st.session_state.idx += 1
-                st.session_state.ocr_text = ""
+                st.session_state.parsed_fields = default_fields.copy()
                 st.rerun()
         with nav_col4:
             if st.button("↩️ Undo Last Save") and st.session_state.records:
@@ -188,12 +262,12 @@ if st.session_state.image_paths:
                 if os.path.exists(last_file):
                     os.remove(last_file)
                 st.session_state.idx = max(0, st.session_state.idx - 1)
-                st.session_state.ocr_text = ""
+                st.session_state.parsed_fields = default_fields.copy()
                 st.rerun()
 
         st.divider()
 
-        # Left Column: Dual Cropper & Zoom Controls
+        # Left Column: Dual Cropper & Zoom
         col1, col2 = st.columns([1, 1])
 
         with col1:
@@ -239,13 +313,11 @@ if st.session_state.image_paths:
                     key="barcode_cropper",
                 )
 
-        # Right Column: Barcode & OCR Fields
+        # Right Column: Barcode & Parsed Symbiota Fields
         with col2:
             st.markdown("#### 1. Barcode Identification")
 
-            # Try multi-angle full-image auto decode first
             auto_barcode = decode_barcode_advanced(image)
-
             cat_num = st.text_input(
                 "Catalog Number (Barcode)", value=auto_barcode
             )
@@ -259,7 +331,7 @@ if st.session_state.image_paths:
                         st.success(f"Barcode Detected: {cat_num}")
                     else:
                         st.error(
-                            "Could not read barcode from selected crop. Please enter manually above."
+                            "Could not read barcode from crop. Enter manually above."
                         )
             with b_col2:
                 st.image(
@@ -268,35 +340,70 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            st.markdown("#### 2. Label OCR Verification")
+            st.markdown("#### 2. Label Parsing & Symbiota Fields")
 
             engine_label = ocr_engine.split()[0]
-            if st.button(f"Run OCR ({engine_label})"):
+            if st.button(f"Run OCR & Parse ({engine_label})"):
                 if ocr_engine == "EasyOCR (Deep Learning - Crop)":
-                    with st.spinner("EasyOCR processing crop..."):
-                        st.session_state.ocr_text = run_easyocr(label_crop)
+                    with st.spinner("EasyOCR reading label..."):
+                        img_np = np.array(label_crop)
+                        results = reader.readtext(img_np, detail=0)
+                        raw_text = " ".join(results)
+                        st.session_state.parsed_fields = (
+                            parse_label_heuristics(raw_text)
+                        )
                 elif ocr_engine == "Tesseract (Local Crop - Free)":
-                    st.session_state.ocr_text = run_tesseract_ocr(label_crop)
+                    raw_text = pytesseract.image_to_string(label_crop)
+                    st.session_state.parsed_fields = parse_label_heuristics(
+                        " ".join(raw_text.split())
+                    )
                 else:
                     if not api_key:
                         st.error(
                             "Please enter a Gemini API Key in the sidebar."
                         )
                     else:
-                        with st.spinner("Gemini reading full sheet..."):
-                            st.session_state.ocr_text = run_gemini_ocr(
+                        with st.spinner("Gemini parsing label fields..."):
+                            st.session_state.parsed_fields = run_gemini_parser(
                                 image, api_key
                             )
 
-            o_col1, o_col2 = st.columns([1, 1])
-            with o_col1:
-                st.image(label_crop, caption="Label Crop Preview")
-            with o_col2:
-                raw_label_text = st.text_area(
-                    "Verbatim Label Text",
-                    value=st.session_state.ocr_text,
-                    height=180,
+            pf = st.session_state.parsed_fields
+
+            # Interactive Symbiota Input Fields
+            sci_name = st.text_input(
+                "scientificName", value=pf.get("scientificName", "")
+            )
+
+            f_col1, f_col2, f_col3 = st.columns([1, 1, 1])
+            with f_col1:
+                rec_by = st.text_input(
+                    "recordedBy (Collector)", value=pf.get("recordedBy", "")
                 )
+            with f_col2:
+                rec_num = st.text_input(
+                    "recordNumber", value=pf.get("recordNumber", "")
+                )
+            with f_col3:
+                ev_date = st.text_input(
+                    "eventDate", value=pf.get("eventDate", "")
+                )
+
+            geo_col1, geo_col2, geo_col3 = st.columns([1, 1, 1])
+            with geo_col1:
+                cntry = st.text_input("country", value=pf.get("country", "USA"))
+            with geo_col2:
+                state_prov = st.text_input(
+                    "stateProvince", value=pf.get("stateProvince", "")
+                )
+            with geo_col3:
+                county = st.text_input("county", value=pf.get("county", ""))
+
+            locality = st.text_input("locality", value=pf.get("locality", ""))
+            habitat = st.text_input("habitat", value=pf.get("habitat", ""))
+            verb_label = st.text_area(
+                "verbatimLabel", value=pf.get("verbatimLabel", ""), height=120
+            )
 
             st.divider()
 
@@ -317,24 +424,33 @@ if st.session_state.image_paths:
                             "institutionCode": inst_code,
                             "collectionCode": coll_code,
                             "catalogNumber": cat_num,
+                            "scientificName": sci_name,
+                            "recordedBy": rec_by,
+                            "recordNumber": rec_num,
+                            "eventDate": ev_date,
+                            "country": cntry,
+                            "stateProvince": state_prov,
+                            "county": county,
+                            "locality": locality,
+                            "habitat": habitat,
+                            "verbatimLabel": verb_label,
                             "associatedMedia": new_filename,
-                            "verbatimLabel": raw_label_text,
                         }
                     )
 
-                    st.session_state.ocr_text = ""
+                    st.session_state.parsed_fields = default_fields.copy()
                     st.session_state.idx += 1
                     st.rerun()
     else:
         st.success("Batch processing complete!")
 
-# Interactive Editable Table
+# Live Symbiota Import Spreadsheet Table
 st.divider()
 st.markdown("### 📊 Live Symbiota Import Spreadsheet")
 
 if st.session_state.records:
     st.caption(
-        "You can edit cells directly in the table below before downloading."
+        "You can edit any cell directly in the table below before downloading."
     )
     df = pd.DataFrame(st.session_state.records)
 
