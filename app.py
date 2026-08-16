@@ -3,7 +3,9 @@ import os
 import shutil
 import tempfile
 import zipfile
+import easyocr
 import google.generativeai as genai
+import numpy as np
 import pandas as pd
 from PIL import Image
 from pyzbar.pyzbar import decode
@@ -15,6 +17,15 @@ st.set_page_config(
     layout="wide", page_title="Herbarium Image-First Digitization"
 )
 st.title("Herbarium Image-First Databasing Tool")
+
+
+# Cache EasyOCR model in memory to prevent re-initialization on every click
+@st.cache_resource
+def load_easyocr_reader():
+    return easyocr.Reader(["en"], gpu=False)
+
+
+reader = load_easyocr_reader()
 
 # Initialize Session State
 if "records" not in st.session_state:
@@ -36,36 +47,44 @@ coll_code = st.sidebar.text_input("collectionCode", value="Herbarium")
 # Sidebar: OCR Engine Choice
 st.sidebar.header("2. Engine Settings")
 ocr_engine = st.sidebar.radio(
-    "Select OCR Engine", ["Gemini AI (Recommended)", "Tesseract (Local Crop)"]
+    "Select OCR Engine",
+    [
+        "EasyOCR (Deep Learning - Crop)",
+        "Tesseract (Standard - Crop)",
+        "Gemini AI (Full Sheet Auto-Detect)",
+    ],
 )
 
 api_key = ""
-if ocr_engine == "Gemini AI (Recommended)":
+if ocr_engine == "Gemini AI (Full Sheet Auto-Detect)":
     api_key = st.sidebar.text_input(
-        "Gemini API Key",
+        "Gemini API Key (Personal Account)",
         type="password",
         value=st.secrets.get("GEMINI_API_KEY", ""),
     )
 
 
 # Helper Functions
-def run_gemini_ocr(img: Image.Image, key: str) -> str:
-    try:
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = (
-            "Extract all text from the specimen label in this herbarium sheet image. "
-            "Return only the verbatim label text."
-        )
-        response = model.generate_content([prompt, img])
-        return response.text.strip()
-    except Exception as e:
-        return f"Gemini Error: {str(e)}"
+def run_easyocr(cropped_img: Image.Image) -> str:
+    img_np = np.array(cropped_img)
+    results = reader.readtext(img_np, detail=0)
+    return " ".join(results)
 
 
 def run_tesseract_ocr(cropped_img: Image.Image) -> str:
     raw_ocr = pytesseract.image_to_string(cropped_img)
     return " ".join(raw_ocr.split())
+
+
+def run_gemini_ocr(img: Image.Image, key: str) -> str:
+    try:
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = "Extract all text from the specimen label in this herbarium sheet image. Return only verbatim label text."
+        response = model.generate_content([prompt, img])
+        return response.text.strip()
+    except Exception as e:
+        return f"Gemini Error: {str(e)}"
 
 
 # Sidebar: Upload Batch
@@ -106,7 +125,7 @@ if st.session_state.image_paths:
         img_path = st.session_state.image_paths[st.session_state.idx]
         image = Image.open(img_path)
 
-        # Session Progress & Navigation Toolbar
+        # Progress & Navigation Toolbar
         nav_col1, nav_col2, nav_col3, nav_col4 = st.columns([2, 1, 1, 1])
         with nav_col1:
             st.markdown(
@@ -138,16 +157,15 @@ if st.session_state.image_paths:
 
         col1, col2 = st.columns([1, 1])
 
-        # Left Column: Image Viewer / Cropper
+        # Left Column: Image Cropper
         with col1:
-            st.write("**Specimen View**")
+            st.write("**Specimen View (Crop Label or Barcode)**")
             cropped_img = st_cropper(
                 image, realtime_update=True, box_color="#00FF00"
             )
 
-        # Right Column: Data Entry with Visual Side-by-Side Verification
+        # Right Column: Data Verification
         with col2:
-            # 1. Barcode Detection & Visual Snippet
             st.markdown("#### 1. Barcode Identification")
             barcodes = decode(image)
 
@@ -157,7 +175,6 @@ if st.session_state.image_paths:
             if barcodes:
                 b = barcodes[0]
                 auto_barcode = b.data.decode("utf-8")
-                # Auto-crop the detected barcode for visual confirmation
                 rect = b.rect
                 pad = 30
                 w, h = image.size
@@ -174,7 +191,9 @@ if st.session_state.image_paths:
                 if barcode_crop:
                     st.image(barcode_crop, caption="Auto-Detected Barcode")
                 else:
-                    st.caption("No barcode auto-detected. Use button below.")
+                    st.caption(
+                        "No barcode auto-detected. Use crop box button."
+                    )
 
             with b_col2:
                 cat_num = st.text_input(
@@ -190,26 +209,29 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            # 2. Label OCR & Visual Snippet
+            # Label OCR Verification
             st.markdown("#### 2. Label OCR Verification")
 
-            # Trigger OCR Execution
             if "ocr_text" not in st.session_state:
                 st.session_state.ocr_text = ""
 
-            if st.button(f"Run OCR ({ocr_engine.split()[0]})"):
-                if ocr_engine == "Gemini AI (Recommended)":
+            engine_label = ocr_engine.split()[0]
+            if st.button(f"Run OCR ({engine_label})"):
+                if ocr_engine == "EasyOCR (Deep Learning - Crop)":
+                    with st.spinner("EasyOCR processing crop..."):
+                        st.session_state.ocr_text = run_easyocr(cropped_img)
+                elif ocr_engine == "Tesseract (Standard - Crop)":
+                    st.session_state.ocr_text = run_tesseract_ocr(cropped_img)
+                else:
                     if not api_key:
                         st.error(
                             "Please enter a Gemini API Key in the sidebar."
                         )
                     else:
-                        with st.spinner("Gemini reading label..."):
+                        with st.spinner("Gemini reading full sheet..."):
                             st.session_state.ocr_text = run_gemini_ocr(
                                 image, api_key
                             )
-                else:
-                    st.session_state.ocr_text = run_tesseract_ocr(cropped_img)
 
             o_col1, o_col2 = st.columns([1, 1])
             with o_col1:
@@ -224,7 +246,6 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            # Save & Next Button
             if st.button("💾 Save Record & Next Specimen", type="primary"):
                 if not cat_num:
                     st.error("Catalog Number is required.")
