@@ -46,6 +46,7 @@ default_fields = {
     "stateProvince": "",
     "county": "",
     "locality": "",
+    "elevationInMeters": "",
     "minimumElevationInMeters": "",
     "maximumElevationInMeters": "",
     "verbatimElevation": "",
@@ -155,7 +156,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         COORDINATE & ELEVATION INSTRUCTIONS:
         1. Extract "verbatimCoordinates" exactly as printed (e.g., 46°43'49.4"N 117°10'06.6"W or 11T 487123E 5175210N).
         2. Automatically convert any DMS (Degrees, Minutes, Seconds) or UTM coordinates into numeric "decimalLatitude" and "decimalLongitude" in decimal degrees (e.g., 46.73039, -117.16850). Ensure West and South coordinates are negative.
-        3. Extract "verbatimElevation" as printed and convert numeric values to meters in "minimumElevationInMeters" and "maximumElevationInMeters".
+        3. Extract "verbatimElevation" as printed.
+           - If there is ONLY a single elevation value (e.g., "1200 ft" or "500 m"), convert it to meters and place it in "elevationInMeters". Leave "minimumElevationInMeters" and "maximumElevationInMeters" as empty strings ("").
+           - If there is an elevation RANGE (e.g., "1200-1500 ft" or "500-600 m"), convert the values to meters and place them in "minimumElevationInMeters" and "maximumElevationInMeters". Leave "elevationInMeters" as an empty string ("").
 
         Also locate bounding boxes normalized to a 0-1000 scale for the barcode sticker and for the primary specimen text label in format [ymin, xmin, ymax, xmax].
 
@@ -172,8 +175,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "stateProvince": "State or Province",
             "county": "County",
             "locality": "Detailed locality description",
-            "minimumElevationInMeters": "Min elevation numeric value in meters",
-            "maximumElevationInMeters": "Max elevation numeric value in meters",
+            "elevationInMeters": "Single elevation value converted to meters (empty if range)",
+            "minimumElevationInMeters": "Min elevation value in meters (empty if single value)",
+            "maximumElevationInMeters": "Max elevation value in meters (empty if single value)",
             "verbatimElevation": "Raw elevation string as recorded on label (e.g. 1200 ft)",
             "decimalLatitude": "Converted numeric latitude in decimal degrees",
             "decimalLongitude": "Converted numeric longitude in decimal degrees",
@@ -416,12 +420,16 @@ if st.session_state.image_paths:
                     value=pf.get("verbatimCoordinates", ""),
                 )
             with loc_col2:
+                elev_single = st.text_input(
+                    "elevationInMeters (Single Value)",
+                    value=pf.get("elevationInMeters", ""),
+                )
                 min_elev = st.text_input(
-                    "minimumElevationInMeters",
+                    "minimumElevationInMeters (Range Min)",
                     value=pf.get("minimumElevationInMeters", ""),
                 )
                 max_elev = st.text_input(
-                    "maximumElevationInMeters",
+                    "maximumElevationInMeters (Range Max)",
                     value=pf.get("maximumElevationInMeters", ""),
                 )
                 verb_elev = st.text_input(
@@ -470,6 +478,7 @@ if st.session_state.image_paths:
                             "decimalLatitude": dec_lat,
                             "decimalLongitude": dec_lon,
                             "verbatimCoordinates": verb_coord,
+                            "elevationInMeters": elev_single,
                             "minimumElevationInMeters": min_elev,
                             "maximumElevationInMeters": max_elev,
                             "verbatimElevation": verb_elev,
