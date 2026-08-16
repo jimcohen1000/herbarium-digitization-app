@@ -9,5 +9,5 @@ pyzbar
 pytesseract
 pandas
 pillow
-google-generativeai
+google-genai
 zxing-cpp
