@@ -1,0 +1,7 @@
+streamlit
+streamlit-cropper
+pyzbar
+pytesseract
+pandas
+pillow
+google-generativeai
