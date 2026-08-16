@@ -84,37 +84,58 @@ if ocr_engine == "Gemini AI (Full Sheet Auto-Parse)":
     )
 
 
-# Helper Functions
-def decode_barcode_advanced(img: Image.Image) -> str:
-    """Multi-angle, dual-engine (zxing-cpp + pyzbar) barcode reader with padding."""
-    img_padded = ImageOps.expand(img, border=30, fill="white")
-    gray = img_padded.convert("L")
-    contrast = ImageEnhance.Contrast(gray).enhance(2.5)
+import cv2
+import numpy as np
+from PIL import Image, ImageOps
+import zxingcpp
 
+
+def decode_barcode_fullres(
+    img: Image.Image, crop_box: tuple = None
+) -> str:
+    """Decodes barcodes from full-resolution source pixels with adaptive binarization."""
+    # 1. If cropped, slice full-resolution source pixels
+    if crop_box:
+        w, h = img.size
+        # Normalize and crop on source resolution
+        left, top, right, bottom = crop_box
+        img = img.crop((left, top, right, bottom))
+
+    # 2. Add padding (Quiet Zone)
+    img_padded = ImageOps.expand(img, border=40, fill="white")
+
+    # 3. Convert to OpenCV Binarized (Black/White Adaptive Threshold)
+    open_cv_image = np.array(img_padded.convert("L"))
+    binarized = cv2.adaptiveThreshold(
+        open_cv_image,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11,
+        2,
+    )
+    pil_binarized = Image.fromarray(binarized)
+
+    # 4. Try ZXing on raw and binarized versions across 4 rotations
     for angle in [0, 90, 180, 270]:
-        rotated_img = (
+        rot_raw = (
             img_padded if angle == 0 else img_padded.rotate(angle, expand=True)
         )
-        rotated_contrast = (
-            contrast if angle == 0 else contrast.rotate(angle, expand=True)
+        rot_bin = (
+            pil_binarized
+            if angle == 0
+            else pil_binarized.rotate(angle, expand=True)
         )
 
-        try:
-            results = zxingcpp.read_barcodes(rotated_img)
-            if results and results[0].text:
-                return results[0].text
-        except Exception:
-            pass
-
-        try:
-            barcodes = decode(rotated_contrast)
-            if barcodes:
-                return barcodes[0].data.decode("utf-8")
-        except Exception:
-            pass
+        for target in [rot_raw, rot_bin]:
+            try:
+                results = zxingcpp.read_barcodes(target)
+                if results and results[0].text:
+                    return results[0].text
+            except Exception:
+                pass
 
     return ""
-
 
 def parse_label_heuristics(text: str) -> dict:
     """Extracts common Symbiota fields from text using pattern matching."""
