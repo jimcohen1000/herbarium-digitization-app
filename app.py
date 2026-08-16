@@ -111,7 +111,8 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
     try:
         client = genai.Client(api_key=key)
 
-        candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+        # Active production models
+        candidate_models = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
 
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label and extract the data into Symbiota/Darwin Core fields.
@@ -153,7 +154,6 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         res = default_fields.copy()
         res["verbatimLabel"] = f"API Error: {str(e)}"
         return res
-
 
 # Sidebar: Upload Batch
 st.sidebar.header("3. Upload Batch")
