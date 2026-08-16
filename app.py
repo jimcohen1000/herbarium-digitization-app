@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+import cv2
 import easyocr
 import google.generativeai as genai
 import numpy as np
@@ -84,27 +85,12 @@ if ocr_engine == "Gemini AI (Full Sheet Auto-Parse)":
     )
 
 
-import cv2
-import numpy as np
-from PIL import Image, ImageOps
-import zxingcpp
-
-
-def decode_barcode_fullres(
-    img: Image.Image, crop_box: tuple = None
-) -> str:
-    """Decodes barcodes from full-resolution source pixels with adaptive binarization."""
-    # 1. If cropped, slice full-resolution source pixels
-    if crop_box:
-        w, h = img.size
-        # Normalize and crop on source resolution
-        left, top, right, bottom = crop_box
-        img = img.crop((left, top, right, bottom))
-
-    # 2. Add padding (Quiet Zone)
+# Helper Functions
+def decode_barcode_fullres(img: Image.Image) -> str:
+    """Decodes barcodes using OpenCV adaptive binarization, quiet zone padding, and ZXing across 4 rotations."""
     img_padded = ImageOps.expand(img, border=40, fill="white")
 
-    # 3. Convert to OpenCV Binarized (Black/White Adaptive Threshold)
+    # Binarize with OpenCV for low contrast / faint barcodes
     open_cv_image = np.array(img_padded.convert("L"))
     binarized = cv2.adaptiveThreshold(
         open_cv_image,
@@ -116,7 +102,6 @@ def decode_barcode_fullres(
     )
     pil_binarized = Image.fromarray(binarized)
 
-    # 4. Try ZXing on raw and binarized versions across 4 rotations
     for angle in [0, 90, 180, 270]:
         rot_raw = (
             img_padded if angle == 0 else img_padded.rotate(angle, expand=True)
@@ -135,7 +120,15 @@ def decode_barcode_fullres(
             except Exception:
                 pass
 
+            try:
+                barcodes = decode(target)
+                if barcodes:
+                    return barcodes[0].data.decode("utf-8")
+            except Exception:
+                pass
+
     return ""
+
 
 def parse_label_heuristics(text: str) -> dict:
     """Extracts common Symbiota fields from text using pattern matching."""
@@ -189,7 +182,7 @@ def parse_label_heuristics(text: str) -> dict:
 
 
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Gemini API to directly extract and parse Symbiota fields as structured JSON."""
+    """Uses Gemini API to extract and parse Symbiota fields as structured JSON."""
     try:
         genai.configure(api_key=key)
         model = genai.GenerativeModel("gemini-1.5-flash")
@@ -258,7 +251,7 @@ if st.session_state.image_paths:
         img_path = st.session_state.image_paths[st.session_state.idx]
         image = Image.open(img_path)
 
-        # Toolbar
+        # Navigation Toolbar
         nav_col1, nav_col2, nav_col3, nav_col4 = st.columns([2, 1, 1, 1])
         with nav_col1:
             st.markdown(
@@ -338,7 +331,7 @@ if st.session_state.image_paths:
         with col2:
             st.markdown("#### 1. Barcode Identification")
 
-            auto_barcode = decode_barcode_advanced(image)
+            auto_barcode = decode_barcode_fullres(image)
             cat_num = st.text_input(
                 "Catalog Number (Barcode)", value=auto_barcode
             )
@@ -346,7 +339,7 @@ if st.session_state.image_paths:
             b_col1, b_col2 = st.columns([1, 1])
             with b_col1:
                 if st.button("Read Barcode from Crop Box"):
-                    cropped_code = decode_barcode_advanced(barcode_crop)
+                    cropped_code = decode_barcode_fullres(barcode_crop)
                     if cropped_code:
                         cat_num = cropped_code
                         st.success(f"Barcode Detected: {cat_num}")
