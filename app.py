@@ -67,8 +67,6 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     target_img = img
 
     if crop_box and crop_box.get("width", 0) > 0:
-        orig_w, orig_h = img.size
-        # Get coordinates relative to display image box
         left = int(crop_box["left"])
         top = int(crop_box["top"])
         right = int(crop_box["left"] + crop_box["width"])
@@ -79,7 +77,7 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     # Add quiet zone margin
     padded = ImageOps.expand(target_img, border=40, fill="white")
 
-    # OpenCV Adaptive Binarization (improves faint/shadowed barcodes)
+    # OpenCV Adaptive Binarization
     cv_img = np.array(padded.convert("L"))
     binarized = cv2.adaptiveThreshold(
         cv_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
@@ -109,12 +107,38 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
-# Vision API Label Parser
+# Vision API Label Parser with Auto-Model Selection
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
     """Uses Gemini Vision API to structure label data directly into Symbiota JSON fields."""
     try:
         genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+
+        candidate_models = [
+            "gemini-2.5-flash",
+            "gemini-flash-latest",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+        ]
+
+        selected_model = None
+        try:
+            available_models = [
+                m.name.replace("models/", "")
+                for m in genai.list_models()
+                if "generateContent" in m.supported_generation_methods
+            ]
+            for candidate in candidate_models:
+                if candidate in available_models:
+                    selected_model = candidate
+                    break
+        except Exception:
+            pass
+
+        if not selected_model:
+            selected_model = "gemini-2.5-flash"
+
+        model = genai.GenerativeModel(selected_model)
+
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label and extract the data into Symbiota/Darwin Core fields.
         Return ONLY a JSON object matching this schema:
@@ -131,11 +155,13 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "verbatimLabel": "Full exact verbatim label text"
         }
         """
+
         response = model.generate_content(
             [prompt, img],
             generation_config={"response_mime_type": "application/json"},
         )
         return json.loads(response.text)
+
     except Exception as e:
         res = default_fields.copy()
         res["verbatimLabel"] = f"API Error: {str(e)}"
@@ -214,7 +240,9 @@ if st.session_state.image_paths:
 
         # Left Column: Image & Manual Barcode Crop Box
         with col1:
-            st.caption("Optional: Draw blue box over barcode if auto-detect fails.")
+            st.caption(
+                "Optional: Draw blue box over barcode if auto-detect fails."
+            )
             barcode_box = st_cropper(
                 image,
                 realtime_update=True,
@@ -227,12 +255,13 @@ if st.session_state.image_paths:
         with col2:
             st.markdown("#### 1. Barcode Identification")
 
-            # Try auto barcode reading on whole full-res image
             auto_code = decode_barcode_fullres(image)
             cat_num = st.text_input("Catalog Number (Barcode)", value=auto_code)
 
             if st.button("Read Barcode from Blue Crop Box"):
-                cropped_code = decode_barcode_fullres(image, crop_box=barcode_box)
+                cropped_code = decode_barcode_fullres(
+                    image, crop_box=barcode_box
+                )
                 if cropped_code:
                     cat_num = cropped_code
                     st.success(f"Detected: {cat_num}")
@@ -245,7 +274,9 @@ if st.session_state.image_paths:
 
             if st.button("🤖 Parse Sheet with Free Vision AI", type="primary"):
                 if not api_key:
-                    st.error("Please enter a free Gemini API Key in the sidebar.")
+                    st.error(
+                        "Please enter a free Gemini API Key in the sidebar."
+                    )
                 else:
                     with st.spinner("Analyzing sheet with Gemini Vision AI..."):
                         st.session_state.parsed_fields = run_gemini_parser(
@@ -254,28 +285,40 @@ if st.session_state.image_paths:
 
             pf = st.session_state.parsed_fields
 
-            # Form Input Boxes (Pre-filled by AI)
-            sci_name = st.text_input("scientificName", value=pf.get("scientificName", ""))
+            # Form Input Boxes
+            sci_name = st.text_input(
+                "scientificName", value=pf.get("scientificName", "")
+            )
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                rec_by = st.text_input("recordedBy", value=pf.get("recordedBy", ""))
+                rec_by = st.text_input(
+                    "recordedBy", value=pf.get("recordedBy", "")
+                )
             with c2:
-                rec_num = st.text_input("recordNumber", value=pf.get("recordNumber", ""))
+                rec_num = st.text_input(
+                    "recordNumber", value=pf.get("recordNumber", "")
+                )
             with c3:
-                ev_date = st.text_input("eventDate", value=pf.get("eventDate", ""))
+                ev_date = st.text_input(
+                    "eventDate", value=pf.get("eventDate", "")
+                )
 
             g1, g2, g3 = st.columns(3)
             with g1:
                 cntry = st.text_input("country", value=pf.get("country", "USA"))
             with g2:
-                state_prov = st.text_input("stateProvince", value=pf.get("stateProvince", ""))
+                state_prov = st.text_input(
+                    "stateProvince", value=pf.get("stateProvince", "")
+                )
             with g3:
                 county = st.text_input("county", value=pf.get("county", ""))
 
             locality = st.text_input("locality", value=pf.get("locality", ""))
             habitat = st.text_input("habitat", value=pf.get("habitat", ""))
-            verb_label = st.text_area("verbatimLabel", value=pf.get("verbatimLabel", ""), height=100)
+            verb_label = st.text_area(
+                "verbatimLabel", value=pf.get("verbatimLabel", ""), height=100
+            )
 
             st.divider()
 
@@ -285,7 +328,9 @@ if st.session_state.image_paths:
                 else:
                     ext = os.path.splitext(img_path)[1]
                     new_filename = f"{cat_num}{ext}"
-                    dest_path = os.path.join(st.session_state.out_dir, new_filename)
+                    dest_path = os.path.join(
+                        st.session_state.out_dir, new_filename
+                    )
 
                     shutil.copy(img_path, dest_path)
 
@@ -321,7 +366,10 @@ st.markdown("### 📊 Live Symbiota Import Spreadsheet")
 if st.session_state.records:
     df = pd.DataFrame(st.session_state.records)
     edited_df = st.data_editor(
-        df, num_rows="dynamic", use_container_width=True, key="spreadsheet_editor"
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="spreadsheet_editor",
     )
     st.session_state.records = edited_df.to_dict("records")
 else:
