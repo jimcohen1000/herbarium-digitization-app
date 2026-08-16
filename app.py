@@ -34,6 +34,8 @@ if "out_dir" not in st.session_state:
 
 default_fields = {
     "catalogNumber": "",
+    "barcodeBox": [],
+    "labelBox": [],
     "scientificName": "",
     "recordedBy": "",
     "recordNumber": "",
@@ -61,6 +63,25 @@ api_key = st.sidebar.text_input(
     value=st.secrets.get("GEMINI_API_KEY", ""),
     help="Default key is loaded from secrets if available. Clear and type to override.",
 )
+
+
+# Crop helper function for 0-1000 scale bounding boxes
+def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
+    """Crops an image given a [ymin, xmin, ymax, xmax] box normalized to 0-1000 scale."""
+    if not box or len(box) != 4:
+        return None
+    try:
+        w, h = img.size
+        ymin, xmin, ymax, xmax = box
+        abs_left = max(0, int((xmin / 1000.0) * w))
+        abs_top = max(0, int((ymin / 1000.0) * h))
+        abs_right = min(w, int((xmax / 1000.0) * w))
+        abs_bottom = min(h, int((ymax / 1000.0) * h))
+        if abs_right > abs_left and abs_bottom > abs_top:
+            return img.crop((abs_left, abs_top, abs_right, abs_bottom))
+    except Exception:
+        pass
+    return None
 
 
 # Barcode Decoder: Crop directly from full-resolution source pixels
@@ -106,9 +127,9 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
-# Vision API Label Parser using official google-genai SDK
+# Vision API Label Parser with Bounding Box Detection
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Google GenAI SDK to structure label and barcode data directly into Symbiota JSON fields."""
+    """Uses Google GenAI SDK to structure label and bounding box data into Symbiota JSON fields."""
     try:
         client = genai.Client(api_key=key)
 
@@ -121,9 +142,13 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label and any barcode or catalog stickers.
         Extract the data into Symbiota/Darwin Core fields.
+        Also locate bounding boxes normalized to a 0-1000 scale for the barcode sticker and for the primary specimen text label in format [ymin, xmin, ymax, xmax].
+
         Return ONLY a JSON object matching this schema:
         {
             "catalogNumber": "Extracted barcode or catalog ID number",
+            "barcodeBox": [ymin, xmin, ymax, xmax],
+            "labelBox": [ymin, xmin, ymax, xmax],
             "scientificName": "Full genus species infraspecies",
             "recordedBy": "Collector name(s)",
             "recordNumber": "Collector number",
@@ -235,7 +260,7 @@ if st.session_state.image_paths:
         # Left Column: Image & Manual Barcode Crop Box
         with col1:
             st.caption(
-                "Optional: Draw blue box over barcode if auto-detect fails."
+                "Full Specimen View. Draw blue box over barcode if auto-detect fails."
             )
             barcode_box = st_cropper(
                 image,
@@ -245,13 +270,36 @@ if st.session_state.image_paths:
                 return_type="box",
             )
 
-        # Right Column: Data Fields
+        # Right Column: AI Zoomed Crops & Data Fields
         with col2:
             pf = st.session_state.parsed_fields
 
+            # Show Zoomed Crops when detected
+            b_crop = crop_box_1000(image, pf.get("barcodeBox"))
+            l_crop = crop_box_1000(image, pf.get("labelBox"))
+
+            if b_crop or l_crop:
+                st.markdown("#### 🔎 AI Zoomed Detection Views")
+                zcol1, zcol2 = st.columns(2)
+                with zcol1:
+                    if b_crop:
+                        st.image(
+                            b_crop,
+                            caption="Detected Barcode Region",
+                            use_container_width=True,
+                        )
+                with zcol2:
+                    if l_crop:
+                        st.image(
+                            l_crop,
+                            caption="Detected Label Region",
+                            use_container_width=True,
+                        )
+                st.divider()
+
             st.markdown("#### 1. Barcode Identification")
 
-            # Fallback Logic: Try local OpenCV/ZXing decoder first; if empty, use AI extracted catalogNumber
+            # Fallback Logic: Local Decoder -> AI Catalog Number
             auto_code = decode_barcode_fullres(image)
             if not auto_code and pf.get("catalogNumber"):
                 auto_code = pf.get("catalogNumber")
@@ -358,7 +406,7 @@ if st.session_state.image_paths:
     else:
         st.success("Batch processing complete!")
 
-# Live Symbiota Export Spreadsheet
+# Live Symbiota Export Spreadsheet & Image Review
 st.divider()
 st.markdown("### 📊 Live Symbiota Import Spreadsheet")
 
@@ -370,7 +418,39 @@ if st.session_state.records:
         use_container_width=True,
         key="spreadsheet_editor",
     )
+
+    # Sync user spreadsheet edits back to session state
     st.session_state.records = edited_df.to_dict("records")
+
+    st.markdown("### 🖼️ Saved Specimen Record Viewer")
+    rec_labels = [
+        f"Row {i+1}: [{r.get('catalogNumber', 'No-ID')}] {r.get('scientificName', 'Unidentified')}"
+        for i, r in enumerate(st.session_state.records)
+    ]
+    selected_idx = st.selectbox(
+        "Select a saved record to inspect its image:",
+        options=range(len(rec_labels)),
+        format_func=lambda x: rec_labels[x],
+    )
+
+    if selected_idx < len(st.session_state.records):
+        rec = st.session_state.records[selected_idx]
+        img_name = rec.get("associatedMedia", "")
+        saved_img_path = os.path.join(st.session_state.out_dir, img_name)
+
+        rcol1, rcol2 = st.columns([1, 1])
+        with rcol1:
+            if os.path.exists(saved_img_path):
+                st.image(
+                    saved_img_path,
+                    caption=f"Renamed File: {img_name}",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("Saved image file not found.")
+        with rcol2:
+            st.markdown("**Saved Record Details**")
+            st.json(rec)
 else:
     st.info("No records saved in current session.")
 
