@@ -25,6 +25,8 @@ if "records" not in st.session_state:
     st.session_state.records = []
 if "idx" not in st.session_state:
     st.session_state.idx = 0
+if "last_parsed_idx" not in st.session_state:
+    st.session_state.last_parsed_idx = -1
 if "image_paths" not in st.session_state:
     st.session_state.image_paths = []
 if "work_dir" not in st.session_state:
@@ -44,7 +46,14 @@ default_fields = {
     "stateProvince": "",
     "county": "",
     "locality": "",
+    "minimumElevationInMeters": "",
+    "maximumElevationInMeters": "",
+    "verbatimElevation": "",
+    "decimalLatitude": "",
+    "decimalLongitude": "",
+    "verbatimCoordinates": "",
     "habitat": "",
+    "substrate": "",
     "verbatimLabel": "",
 }
 
@@ -127,7 +136,7 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
-# Vision API Label Parser with Bounding Box Detection
+# Vision API Label Parser with Expanded Darwin Core Schema
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
     """Uses Google GenAI SDK to structure label and bounding box data into Symbiota JSON fields."""
     try:
@@ -141,7 +150,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label and any barcode or catalog stickers.
-        Extract the data into Symbiota/Darwin Core fields.
+        Extract the data into standard Symbiota/Darwin Core fields.
         Also locate bounding boxes normalized to a 0-1000 scale for the barcode sticker and for the primary specimen text label in format [ymin, xmin, ymax, xmax].
 
         Return ONLY a JSON object matching this schema:
@@ -157,7 +166,14 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "stateProvince": "State or Province",
             "county": "County",
             "locality": "Detailed locality description",
-            "habitat": "Habitat or substrate notes",
+            "minimumElevationInMeters": "Min elevation numeric value in meters",
+            "maximumElevationInMeters": "Max elevation numeric value in meters",
+            "verbatimElevation": "Raw elevation string as recorded on label (e.g. 1200 ft)",
+            "decimalLatitude": "Numeric decimal latitude (e.g. 46.7304)",
+            "decimalLongitude": "Numeric decimal longitude (e.g. -117.1685)",
+            "verbatimCoordinates": "Raw coordinates string (e.g. 46°43'49.4\"N 117°10'06.6\"W or TRS)",
+            "habitat": "Habitat or community notes",
+            "substrate": "Soil type, rock type, or substrate notes",
             "verbatimLabel": "Full exact verbatim label text"
         }
         """
@@ -225,6 +241,22 @@ if st.session_state.image_paths:
         img_path = st.session_state.image_paths[st.session_state.idx]
         image = Image.open(img_path)
 
+        # Automatic Vision AI Trigger on Image Load
+        if st.session_state.last_parsed_idx != st.session_state.idx:
+            if api_key:
+                with st.spinner(
+                    f"🤖 Auto-parsing specimen {st.session_state.idx + 1} with Vision AI..."
+                ):
+                    st.session_state.parsed_fields = run_gemini_parser(
+                        image, api_key
+                    )
+                    st.session_state.last_parsed_idx = st.session_state.idx
+                    st.rerun()
+            else:
+                st.sidebar.warning(
+                    "⚠️ Enter Gemini API Key to enable auto-parsing."
+                )
+
         # Toolbar
         nav1, nav2, nav3, nav4 = st.columns([2, 1, 1, 1])
         with nav1:
@@ -257,7 +289,7 @@ if st.session_state.image_paths:
 
         col1, col2 = st.columns([1, 1])
 
-        # Left Column: Image & Manual Barcode Crop Box
+        # Left Column: Full Image & Cropper
         with col1:
             st.caption(
                 "Full Specimen View. Draw blue box over barcode if auto-detect fails."
@@ -270,7 +302,7 @@ if st.session_state.image_paths:
                 return_type="box",
             )
 
-        # Right Column: AI Zoomed Crops & Data Fields
+        # Right Column: Detection Crops & Darwin Core Data Fields
         with col2:
             pf = st.session_state.parsed_fields
 
@@ -299,7 +331,6 @@ if st.session_state.image_paths:
 
             st.markdown("#### 1. Barcode Identification")
 
-            # Fallback Logic: Local Decoder -> AI Catalog Number
             auto_code = decode_barcode_fullres(image)
             if not auto_code and pf.get("catalogNumber"):
                 auto_code = pf.get("catalogNumber")
@@ -318,21 +349,22 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            st.markdown("#### 2. Vision AI Label Parsing")
+            st.markdown("#### 2. Vision AI Label Data")
 
-            if st.button("🤖 Parse Sheet with Free Vision AI", type="primary"):
+            if st.button("🔄 Re-Parse with Vision AI"):
                 if not api_key:
                     st.error(
                         "Please enter a free Gemini API Key in the sidebar."
                     )
                 else:
-                    with st.spinner("Analyzing sheet with Gemini Vision AI..."):
+                    with st.spinner("Re-analyzing sheet with Vision AI..."):
                         st.session_state.parsed_fields = run_gemini_parser(
                             image, api_key
                         )
+                        st.session_state.last_parsed_idx = st.session_state.idx
                         st.rerun()
 
-            # Form Input Boxes
+            # Form Input Fields
             sci_name = st.text_input(
                 "scientificName", value=pf.get("scientificName", "")
             )
@@ -362,7 +394,42 @@ if st.session_state.image_paths:
                 county = st.text_input("county", value=pf.get("county", ""))
 
             locality = st.text_input("locality", value=pf.get("locality", ""))
-            habitat = st.text_input("habitat", value=pf.get("habitat", ""))
+
+            # Coordinates & Elevation
+            st.markdown("##### 📍 Location, Elevation & Substrate")
+            loc_col1, loc_col2 = st.columns(2)
+            with loc_col1:
+                dec_lat = st.text_input(
+                    "decimalLatitude", value=pf.get("decimalLatitude", "")
+                )
+                dec_lon = st.text_input(
+                    "decimalLongitude", value=pf.get("decimalLongitude", "")
+                )
+                verb_coord = st.text_input(
+                    "verbatimCoordinates",
+                    value=pf.get("verbatimCoordinates", ""),
+                )
+            with loc_col2:
+                min_elev = st.text_input(
+                    "minimumElevationInMeters",
+                    value=pf.get("minimumElevationInMeters", ""),
+                )
+                max_elev = st.text_input(
+                    "maximumElevationInMeters",
+                    value=pf.get("maximumElevationInMeters", ""),
+                )
+                verb_elev = st.text_input(
+                    "verbatimElevation", value=pf.get("verbatimElevation", "")
+                )
+
+            sub_col1, sub_col2 = st.columns(2)
+            with sub_col1:
+                habitat = st.text_input("habitat", value=pf.get("habitat", ""))
+            with sub_col2:
+                substrate = st.text_input(
+                    "substrate (Soil/Rock)", value=pf.get("substrate", "")
+                )
+
             verb_label = st.text_area(
                 "verbatimLabel", value=pf.get("verbatimLabel", ""), height=100
             )
@@ -394,7 +461,14 @@ if st.session_state.image_paths:
                             "stateProvince": state_prov,
                             "county": county,
                             "locality": locality,
+                            "decimalLatitude": dec_lat,
+                            "decimalLongitude": dec_lon,
+                            "verbatimCoordinates": verb_coord,
+                            "minimumElevationInMeters": min_elev,
+                            "maximumElevationInMeters": max_elev,
+                            "verbatimElevation": verb_elev,
                             "habitat": habitat,
+                            "substrate": substrate,
                             "verbatimLabel": verb_label,
                             "associatedMedia": new_filename,
                         }
@@ -419,7 +493,7 @@ if st.session_state.records:
         key="spreadsheet_editor",
     )
 
-    # Sync user spreadsheet edits back to session state
+    # Sync edits back to session state
     st.session_state.records = edited_df.to_dict("records")
 
     st.markdown("### 🖼️ Saved Specimen Record Viewer")
