@@ -136,9 +136,9 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
-# Vision API Label Parser with Expanded Darwin Core Schema
+# Vision API Label Parser with Direct Gemini Coordinate Conversion
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Google GenAI SDK to structure label and bounding box data into Symbiota JSON fields."""
+    """Uses Google GenAI SDK to parse Darwin Core fields and convert verbatim coordinates into decimal degrees."""
     try:
         client = genai.Client(api_key=key)
 
@@ -150,7 +150,13 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label and any barcode or catalog stickers.
-        Extract the data into standard Symbiota/Darwin Core fields.
+        Extract data into standard Symbiota/Darwin Core fields.
+
+        COORDINATE & ELEVATION INSTRUCTIONS:
+        1. Extract "verbatimCoordinates" exactly as printed (e.g., 46°43'49.4"N 117°10'06.6"W or 11T 487123E 5175210N).
+        2. Automatically convert any DMS (Degrees, Minutes, Seconds) or UTM coordinates into numeric "decimalLatitude" and "decimalLongitude" in decimal degrees (e.g., 46.73039, -117.16850). Ensure West and South coordinates are negative.
+        3. Extract "verbatimElevation" as printed and convert numeric values to meters in "minimumElevationInMeters" and "maximumElevationInMeters".
+
         Also locate bounding boxes normalized to a 0-1000 scale for the barcode sticker and for the primary specimen text label in format [ymin, xmin, ymax, xmax].
 
         Return ONLY a JSON object matching this schema:
@@ -169,9 +175,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "minimumElevationInMeters": "Min elevation numeric value in meters",
             "maximumElevationInMeters": "Max elevation numeric value in meters",
             "verbatimElevation": "Raw elevation string as recorded on label (e.g. 1200 ft)",
-            "decimalLatitude": "Numeric decimal latitude (e.g. 46.7304)",
-            "decimalLongitude": "Numeric decimal longitude (e.g. -117.1685)",
-            "verbatimCoordinates": "Raw coordinates string (e.g. 46°43'49.4\"N 117°10'06.6\"W or TRS)",
+            "decimalLatitude": "Converted numeric latitude in decimal degrees",
+            "decimalLongitude": "Converted numeric longitude in decimal degrees",
+            "verbatimCoordinates": "Raw coordinates string (e.g. 46°43'49.4\"N 117°10'06.6\"W)",
             "habitat": "Habitat or community notes",
             "substrate": "Soil type, rock type, or substrate notes",
             "verbatimLabel": "Full exact verbatim label text"
@@ -289,7 +295,7 @@ if st.session_state.image_paths:
 
         col1, col2 = st.columns([1, 1])
 
-        # Left Column: Full Image & Cropper
+        # Left Column: Full Image & Manual Cropper
         with col1:
             st.caption(
                 "Full Specimen View. Draw blue box over barcode if auto-detect fails."
@@ -302,7 +308,7 @@ if st.session_state.image_paths:
                 return_type="box",
             )
 
-        # Right Column: Detection Crops & Darwin Core Data Fields
+        # Right Column: AI Zoom Crops & Form Inputs
         with col2:
             pf = st.session_state.parsed_fields
 
@@ -480,7 +486,7 @@ if st.session_state.image_paths:
     else:
         st.success("Batch processing complete!")
 
-# Live Symbiota Export Spreadsheet & Image Review
+# Live Symbiota Export Spreadsheet & Saved Image Review
 st.divider()
 st.markdown("### 📊 Live Symbiota Import Spreadsheet")
 
