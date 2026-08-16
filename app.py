@@ -50,24 +50,44 @@ if ocr_engine == "Gemini AI (Full Sheet Auto-Detect)":
     )
 
 
-# Enhanced Barcode Reader with Preprocessing
-def decode_barcode_enhanced(img: Image.Image) -> str:
-    # 1. Direct Pass
-    barcodes = decode(img)
-    if barcodes:
-        return barcodes[0].data.decode("utf-8")
+from PIL import Image, ImageEnhance, ImageOps
+from pyzbar.pyzbar import decode
+import zxingcpp
 
-    # 2. Preprocessed Pass (Grayscale + Contrast Boost + 2x Scale)
-    gray = img.convert("L")
-    enhanced = ImageEnhance.Contrast(gray).enhance(2.0)
-    resized = enhanced.resize((enhanced.width * 2, enhanced.height * 2))
 
-    barcodes_prep = decode(resized)
-    if barcodes_prep:
-        return barcodes_prep[0].data.decode("utf-8")
+def decode_barcode_advanced(img: Image.Image) -> str:
+    """Multi-angle, dual-engine (zxing-cpp + pyzbar) high-accuracy barcode detector."""
+    # 1. Add white margin (Quiet Zone required by decoders)
+    img_padded = ImageOps.expand(img, border=30, fill="white")
+
+    # Prepare variations: Original, High-Contrast Grayscale, Binarized
+    gray = img_padded.convert("L")
+    contrast = ImageEnhance.Contrast(gray).enhance(2.5)
+
+    # 2. Test across 4 Rotations (0°, 90°, 180°, 270°)
+    for angle in [0, 90, 180, 270]:
+        rotated_img = img_padded if angle == 0 else img_padded.rotate(angle, expand=True)
+        rotated_contrast = (
+            contrast if angle == 0 else contrast.rotate(angle, expand=True)
+        )
+
+        # Primary Engine: ZXing-CPP (Handles low res & partial blur best)
+        try:
+            results = zxingcpp.read_barcodes(rotated_img)
+            if results and results[0].text:
+                return results[0].text
+        except Exception:
+            pass
+
+        # Fallback Engine: PyZBar (On High-Contrast image)
+        try:
+            barcodes = decode(rotated_contrast)
+            if barcodes:
+                return barcodes[0].data.decode("utf-8")
+        except Exception:
+            pass
 
     return ""
-
 
 def run_tesseract_ocr(cropped_img: Image.Image) -> str:
     raw_ocr = pytesseract.image_to_string(cropped_img)
