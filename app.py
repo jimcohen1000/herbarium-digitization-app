@@ -107,49 +107,14 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
-# Vision API Label Parser with Dynamic Model Selection
+# Vision API Label Parser with Production Models
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
     """Uses Gemini Vision API to structure label data directly into Symbiota JSON fields."""
     try:
         genai.configure(api_key=key)
 
-        # 1. Candidate standard models in order of universal availability
-        candidate_models = [
-            "gemini-1.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-pro",
-            "gemini-1.5-flash-latest"
-        ]
-
-        selected_model = None
-
-        # 2. Query API to find models authorized for this specific API key
-        try:
-            available_models = [
-                m.name.replace("models/", "")
-                for m in genai.list_models()
-                if "generateContent" in m.supported_generation_methods
-            ]
-            
-            # Check if any of our candidates are in the user's available models
-            for candidate in candidate_models:
-                if candidate in available_models:
-                    selected_model = candidate
-                    break
-            
-            # Fallback: grab any available flash/general model returned by the API
-            if not selected_model and available_models:
-                flash_models = [m for m in available_models if "flash" in m]
-                selected_model = flash_models[0] if flash_models else available_models[0]
-
-        except Exception:
-            pass
-
-        # Ultimate fallback to standard stable model
-        if not selected_model:
-            selected_model = "gemini-1.5-flash"
-
-        model = genai.GenerativeModel(selected_model)
+        # Production models active on all standard free API keys
+        candidate_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
 
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label and extract the data into Symbiota/Darwin Core fields.
@@ -168,11 +133,22 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         }
         """
 
-        response = model.generate_content(
-            [prompt, img],
-            generation_config={"response_mime_type": "application/json"}
-        )
-        return json.loads(response.text)
+        last_error = None
+        for model_name in candidate_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    [prompt, img],
+                    generation_config={"response_mime_type": "application/json"},
+                )
+                if response and response.text:
+                    return json.loads(response.text)
+            except Exception as err:
+                last_error = err
+                continue
+
+        if last_error:
+            raise last_error
 
     except Exception as e:
         res = default_fields.copy()
