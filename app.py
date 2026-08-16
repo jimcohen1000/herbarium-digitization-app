@@ -5,7 +5,8 @@ import shutil
 import tempfile
 import zipfile
 import cv2
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
@@ -74,17 +75,14 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
 
         target_img = img.crop((left, top, right, bottom))
 
-    # Add quiet zone margin
     padded = ImageOps.expand(target_img, border=40, fill="white")
 
-    # OpenCV Adaptive Binarization
     cv_img = np.array(padded.convert("L"))
     binarized = cv2.adaptiveThreshold(
         cv_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
     )
     pil_bin = Image.fromarray(binarized)
 
-    # Decode across 4 rotations
     for angle in [0, 90, 180, 270]:
         rot_raw = padded if angle == 0 else padded.rotate(angle, expand=True)
         rot_bin = pil_bin if angle == 0 else pil_bin.rotate(angle, expand=True)
@@ -107,14 +105,13 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
-# Vision API Label Parser with Production Models
+# Vision API Label Parser using official google-genai SDK
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Gemini Vision API to structure label data directly into Symbiota JSON fields."""
+    """Uses Google GenAI SDK to structure label data directly into Symbiota JSON fields."""
     try:
-        genai.configure(api_key=key)
+        client = genai.Client(api_key=key)
 
-        # Production models active on all standard free API keys
-        candidate_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+        candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label and extract the data into Symbiota/Darwin Core fields.
@@ -136,10 +133,12 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         last_error = None
         for model_name in candidate_models:
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    [prompt, img],
-                    generation_config={"response_mime_type": "application/json"},
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, img],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    ),
                 )
                 if response and response.text:
                     return json.loads(response.text)
