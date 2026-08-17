@@ -53,6 +53,7 @@ default_fields = {
     "decimalLatitude": "",
     "decimalLongitude": "",
     "verbatimCoordinates": "",
+    "reproductiveCondition": "",
     "habitat": "",
     "substrate": "",
     "verbatimLabel": "",
@@ -150,7 +151,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         ]
 
         prompt = """
-        Examine this herbarium specimen sheet. Locate the primary specimen label and any barcode or catalog stickers.
+        Examine this herbarium specimen sheet. Locate the primary specimen label, the plant specimen itself, and any barcode or catalog stickers.
         Extract data into standard Symbiota/Darwin Core fields.
 
         COORDINATE & ELEVATION INSTRUCTIONS:
@@ -159,6 +160,11 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         3. Extract "verbatimElevation" as printed.
            - If there is ONLY a single elevation value (e.g., "1200 ft" or "500 m"), convert it to meters and place it in "elevationInMeters". Leave "minimumElevationInMeters" and "maximumElevationInMeters" as empty strings ("").
            - If there is an elevation RANGE (e.g., "1200-1500 ft" or "500-600 m"), convert the values to meters and place them in "minimumElevationInMeters" and "maximumElevationInMeters". Leave "elevationInMeters" as an empty string ("").
+
+        PHENOLOGY / REPRODUCTIVE CONDITION INSTRUCTIONS:
+        4. Visually inspect the plant specimen on the sheet and classify its phenology into EXACTLY one of these standard Symbiota terms for "reproductiveCondition":
+           ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"].
+           - If the stage is unclear, unidentifiable, or ambiguous, leave "reproductiveCondition" as an empty string ("").
 
         Also locate bounding boxes normalized to a 0-1000 scale for the barcode sticker and for the primary specimen text label in format [ymin, xmin, ymax, xmax].
 
@@ -182,6 +188,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "decimalLatitude": "Converted numeric latitude in decimal degrees",
             "decimalLongitude": "Converted numeric longitude in decimal degrees",
             "verbatimCoordinates": "Raw coordinates string (e.g. 46°43'49.4\"N 117°10'06.6\"W)",
+            "reproductiveCondition": "Exact match from Symbiota controlled terms or empty string if unconfirmed",
             "habitat": "Habitat or community notes",
             "substrate": "Soil type, rock type, or substrate notes",
             "verbatimLabel": "Full exact verbatim label text"
@@ -406,7 +413,7 @@ if st.session_state.image_paths:
             locality = st.text_input("locality", value=pf.get("locality", ""))
 
             # Coordinates & Elevation
-            st.markdown("##### 📍 Location, Elevation & Substrate")
+            st.markdown("##### 📍 Location, Elevation & Phenology")
             loc_col1, loc_col2 = st.columns(2)
             with loc_col1:
                 dec_lat = st.text_input(
@@ -435,6 +442,36 @@ if st.session_state.image_paths:
                 verb_elev = st.text_input(
                     "verbatimElevation", value=pf.get("verbatimElevation", "")
                 )
+
+            # Phenology Controlled Vocabulary Dropdown
+            symbiota_pheno_terms = [
+                "",
+                "In Flower",
+                "In Fruit",
+                "Flowering and Fruiting",
+                "Flower Buds",
+                "Vegetative",
+                "Sterile",
+                "Cones",
+                "Spores",
+            ]
+
+            gemini_pheno_pred = pf.get("reproductiveCondition", "").strip()
+            pheno_idx = next(
+                (
+                    i
+                    for i, opt in enumerate(symbiota_pheno_terms)
+                    if opt.lower() == gemini_pheno_pred.lower()
+                ),
+                0,
+            )
+
+            rep_cond = st.selectbox(
+                "reproductiveCondition (Symbiota Phenology)",
+                options=symbiota_pheno_terms,
+                index=pheno_idx,
+                help="Symbiota controlled vocabulary term for plant phenology stage.",
+            )
 
             sub_col1, sub_col2 = st.columns(2)
             with sub_col1:
@@ -482,6 +519,7 @@ if st.session_state.image_paths:
                             "minimumElevationInMeters": min_elev,
                             "maximumElevationInMeters": max_elev,
                             "verbatimElevation": verb_elev,
+                            "reproductiveCondition": rep_cond,
                             "habitat": habitat,
                             "substrate": substrate,
                             "verbatimLabel": verb_label,
