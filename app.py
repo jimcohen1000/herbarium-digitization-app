@@ -39,23 +39,31 @@ default_fields = {
     "barcodeBox": [],
     "labelBox": [],
     "scientificName": "",
+    "genus": "",
+    "specificEpithet": "",
     "recordedBy": "",
     "recordNumber": "",
     "eventDate": "",
-    "country": "USA",
+    "year": "",
+    "month": "",
+    "day": "",
+    "occurrenceRemarks": "",
+    "habitat": "",
+    "substrate": "",
+    "associatedTaxa": "",
+    "reproductiveCondition": "",
+    "country": "United States",
     "stateProvince": "",
     "county": "",
+    "municipality": "",
     "locality": "",
-    "elevationInMeters": "",
-    "minimumElevationInMeters": "",
-    "maximumElevationInMeters": "",
-    "verbatimElevation": "",
+    "locationRemarks": "",
     "decimalLatitude": "",
     "decimalLongitude": "",
     "verbatimCoordinates": "",
-    "reproductiveCondition": "",
-    "habitat": "",
-    "substrate": "",
+    "minimumElevationInMeters": "",
+    "maximumElevationInMeters": "",
+    "verbatimElevation": "",
     "verbatimLabel": "",
 }
 
@@ -64,8 +72,8 @@ if "parsed_fields" not in st.session_state:
 
 # Sidebar Settings
 st.sidebar.header("1. Institutional Defaults")
-inst_code = st.sidebar.text_input("institutionCode", value="WSU")
-coll_code = st.sidebar.text_input("collectionCode", value="Herbarium")
+inst_code = st.sidebar.text_input("institutionCode", value="Weber State")
+coll_code = st.sidebar.text_input("collectionCode", value="WSCO")
 
 st.sidebar.header("2. Free API Key")
 api_key = st.sidebar.text_input(
@@ -138,9 +146,9 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
-# Vision API Label Parser with Direct Gemini Coordinate Conversion
+# Vision API Label Parser
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Google GenAI SDK to parse Darwin Core fields and convert verbatim coordinates into decimal degrees."""
+    """Uses Google GenAI SDK to parse Darwin Core / Symbiota fields."""
     try:
         client = genai.Client(api_key=key)
 
@@ -151,46 +159,52 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         ]
 
         prompt = """
-        Examine this herbarium specimen sheet. Locate the primary specimen label, the plant specimen itself, and any barcode or catalog stickers.
-        Extract data into standard Symbiota/Darwin Core fields.
+        Examine this herbarium specimen sheet. Locate the primary specimen label, plant specimen, and barcode sticker.
+        Extract data into standard Symbiota / Darwin Core fields.
 
-        COORDINATE & ELEVATION INSTRUCTIONS:
-        1. Extract "verbatimCoordinates" exactly as printed (e.g., 46°43'49.4"N 117°10'06.6"W or 11T 487123E 5175210N).
-        2. Automatically convert any DMS (Degrees, Minutes, Seconds) or UTM coordinates into numeric "decimalLatitude" and "decimalLongitude" in decimal degrees (e.g., 46.73039, -117.16850). Ensure West and South coordinates are negative.
-        3. Extract "verbatimElevation" as printed.
-           - If there is ONLY a single elevation value (e.g., "1200 ft" or "500 m"), convert it to meters and place it in "elevationInMeters". Leave "minimumElevationInMeters" and "maximumElevationInMeters" as empty strings ("").
-           - If there is an elevation RANGE (e.g., "1200-1500 ft" or "500-600 m"), convert the values to meters and place them in "minimumElevationInMeters" and "maximumElevationInMeters". Leave "elevationInMeters" as an empty string ("").
-
-        PHENOLOGY / REPRODUCTIVE CONDITION INSTRUCTIONS:
-        4. Visually inspect the plant specimen on the sheet and classify its phenology into EXACTLY one of these standard Symbiota terms for "reproductiveCondition":
+        STRICT STANDARDIZATION RULES:
+        1. COUNTRY: If the specimen is from the US, set "country" to EXACTLY "United States" (do NOT use "US", "USA", or "United States of America").
+        2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" (e.g. Pinus) and "specificEpithet" (e.g. ponderosa).
+        3. DATES: Extract "eventDate" (e.g. 1984-06-15). Also break out integer values for "year", "month", and "day" separately.
+        4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS or UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
+        5. ELEVATION: Extract "verbatimElevation" as printed. Convert numeric values to meters.
+           - If a single value is given (e.g., 1500 m or 5000 ft), set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that converted value in meters.
+           - If a range is given (e.g., 1500-1800 m), set min and max accordingly.
+        6. PHENOLOGY: Inspect the plant material for flowers, fruits, or cones. Assign "reproductiveCondition" to EXACTLY one of:
            ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"].
-           - If the stage is unclear, unidentifiable, or ambiguous, leave "reproductiveCondition" as an empty string ("").
-
-        Also locate bounding boxes normalized to a 0-1000 scale for the barcode sticker and for the primary specimen text label in format [ymin, xmin, ymax, xmax].
+           - If unclear, unidentifiable, or ambiguous, leave as empty string ("").
 
         Return ONLY a JSON object matching this schema:
         {
             "catalogNumber": "Extracted barcode or catalog ID number",
             "barcodeBox": [ymin, xmin, ymax, xmax],
             "labelBox": [ymin, xmin, ymax, xmax],
-            "scientificName": "Full genus species infraspecies",
+            "scientificName": "Full taxon name including author if present",
+            "genus": "Genus name",
+            "specificEpithet": "Species epithet",
             "recordedBy": "Collector name(s)",
             "recordNumber": "Collector number",
-            "eventDate": "Collection date",
-            "country": "Country",
-            "stateProvince": "State or Province",
-            "county": "County",
-            "locality": "Detailed locality description",
-            "elevationInMeters": "Single elevation value converted to meters (empty if range)",
-            "minimumElevationInMeters": "Min elevation value in meters (empty if single value)",
-            "maximumElevationInMeters": "Max elevation value in meters (empty if single value)",
-            "verbatimElevation": "Raw elevation string as recorded on label (e.g. 1200 ft)",
-            "decimalLatitude": "Converted numeric latitude in decimal degrees",
-            "decimalLongitude": "Converted numeric longitude in decimal degrees",
-            "verbatimCoordinates": "Raw coordinates string (e.g. 46°43'49.4\"N 117°10'06.6\"W)",
-            "reproductiveCondition": "Exact match from Symbiota controlled terms or empty string if unconfirmed",
+            "eventDate": "Collection date in YYYY-MM-DD or verbatim format",
+            "year": "4-digit year",
+            "month": "Numeric month (1-12) or 2-digit month string",
+            "day": "Numeric day (1-31) or 2-digit day string",
+            "occurrenceRemarks": "Plant description or specimen observations",
             "habitat": "Habitat or community notes",
-            "substrate": "Soil type, rock type, or substrate notes",
+            "substrate": "Soil, rock type, or growing medium notes",
+            "associatedTaxa": "Associated species list",
+            "reproductiveCondition": "Exact match from phenology terms or empty string",
+            "country": "Country name (must be 'United States' for US specimens)",
+            "stateProvince": "State or Province",
+            "county": "County or Parish",
+            "municipality": "City, town, or municipality",
+            "locality": "Detailed locality description",
+            "locationRemarks": "Additional location or access notes",
+            "decimalLatitude": "Numeric latitude in decimal degrees",
+            "decimalLongitude": "Numeric longitude in decimal degrees",
+            "verbatimCoordinates": "Raw coordinate string from label",
+            "minimumElevationInMeters": "Min elevation in meters (set equal to max if single value)",
+            "maximumElevationInMeters": "Max elevation in meters (set equal to min if single value)",
+            "verbatimElevation": "Raw elevation string as recorded on label",
             "verbatimLabel": "Full exact verbatim label text"
         }
         """
@@ -381,12 +395,22 @@ if st.session_state.image_paths:
                         st.session_state.last_parsed_idx = st.session_state.idx
                         st.rerun()
 
-            # Form Input Fields
+            # Taxonomy Section
+            st.markdown("##### 🌿 Taxonomy")
             sci_name = st.text_input(
                 "scientificName", value=pf.get("scientificName", "")
             )
+            tax_col1, tax_col2 = st.columns(2)
+            with tax_col1:
+                genus = st.text_input("genus", value=pf.get("genus", ""))
+            with tax_col2:
+                sp_ep = st.text_input(
+                    "specificEpithet", value=pf.get("specificEpithet", "")
+                )
 
-            c1, c2, c3 = st.columns(3)
+            # Collector & Event Details
+            st.markdown("##### 👤 Collector & Event Date")
+            c1, c2 = st.columns(2)
             with c1:
                 rec_by = st.text_input(
                     "recordedBy", value=pf.get("recordedBy", "")
@@ -395,25 +419,44 @@ if st.session_state.image_paths:
                 rec_num = st.text_input(
                     "recordNumber", value=pf.get("recordNumber", "")
                 )
-            with c3:
+
+            d1, d2, d3, d4 = st.columns(4)
+            with d1:
                 ev_date = st.text_input(
                     "eventDate", value=pf.get("eventDate", "")
                 )
+            with d2:
+                yr = st.text_input("year", value=pf.get("year", ""))
+            with d3:
+                mo = st.text_input("month", value=pf.get("month", ""))
+            with d4:
+                dy = st.text_input("day", value=pf.get("day", ""))
 
-            g1, g2, g3 = st.columns(3)
+            # Geography & Locality
+            st.markdown("##### 🗺️ Geography & Locality")
+            g1, g2, g3, g4 = st.columns(4)
             with g1:
-                cntry = st.text_input("country", value=pf.get("country", "USA"))
+                cntry = st.text_input(
+                    "country", value=pf.get("country", "United States")
+                )
             with g2:
                 state_prov = st.text_input(
                     "stateProvince", value=pf.get("stateProvince", "")
                 )
             with g3:
                 county = st.text_input("county", value=pf.get("county", ""))
+            with g4:
+                muni = st.text_input(
+                    "municipality", value=pf.get("municipality", "")
+                )
 
             locality = st.text_input("locality", value=pf.get("locality", ""))
+            loc_rem = st.text_input(
+                "locationRemarks", value=pf.get("locationRemarks", "")
+            )
 
-            # Coordinates & Elevation
-            st.markdown("##### 📍 Location, Elevation & Phenology")
+            # Coordinates, Elevation & Phenology
+            st.markdown("##### 📍 Coordinates, Elevation & Phenology")
             loc_col1, loc_col2 = st.columns(2)
             with loc_col1:
                 dec_lat = st.text_input(
@@ -427,23 +470,19 @@ if st.session_state.image_paths:
                     value=pf.get("verbatimCoordinates", ""),
                 )
             with loc_col2:
-                elev_single = st.text_input(
-                    "elevationInMeters (Single Value)",
-                    value=pf.get("elevationInMeters", ""),
-                )
                 min_elev = st.text_input(
-                    "minimumElevationInMeters (Range Min)",
+                    "minimumElevationInMeters",
                     value=pf.get("minimumElevationInMeters", ""),
                 )
                 max_elev = st.text_input(
-                    "maximumElevationInMeters (Range Max)",
+                    "maximumElevationInMeters",
                     value=pf.get("maximumElevationInMeters", ""),
                 )
                 verb_elev = st.text_input(
                     "verbatimElevation", value=pf.get("verbatimElevation", "")
                 )
 
-            # Phenology Controlled Vocabulary Dropdown
+            # Phenology Dropdown
             symbiota_pheno_terms = [
                 "",
                 "In Flower",
@@ -467,18 +506,26 @@ if st.session_state.image_paths:
             )
 
             rep_cond = st.selectbox(
-                "reproductiveCondition (Symbiota Phenology)",
+                "reproductiveCondition",
                 options=symbiota_pheno_terms,
                 index=pheno_idx,
-                help="Symbiota controlled vocabulary term for plant phenology stage.",
+                help="Symbiota controlled vocabulary for plant phenology stage.",
             )
 
-            sub_col1, sub_col2 = st.columns(2)
-            with sub_col1:
+            # Remarks & Notes
+            st.markdown("##### 📝 Habitat, Substrate & Remarks")
+            rcol1, rcol2 = st.columns(2)
+            with rcol1:
                 habitat = st.text_input("habitat", value=pf.get("habitat", ""))
-            with sub_col2:
+                assoc_taxa = st.text_input(
+                    "associatedTaxa", value=pf.get("associatedTaxa", "")
+                )
+            with rcol2:
                 substrate = st.text_input(
-                    "substrate (Soil/Rock)", value=pf.get("substrate", "")
+                    "substrate", value=pf.get("substrate", "")
+                )
+                occ_rem = st.text_input(
+                    "occurrenceRemarks", value=pf.get("occurrenceRemarks", "")
                 )
 
             verb_label = st.text_area(
@@ -505,23 +552,31 @@ if st.session_state.image_paths:
                             "collectionCode": coll_code,
                             "catalogNumber": cat_num,
                             "scientificName": sci_name,
+                            "genus": genus,
+                            "specificEpithet": sp_ep,
                             "recordedBy": rec_by,
                             "recordNumber": rec_num,
                             "eventDate": ev_date,
+                            "year": yr,
+                            "month": mo,
+                            "day": dy,
+                            "occurrenceRemarks": occ_rem,
+                            "habitat": habitat,
+                            "substrate": substrate,
+                            "associatedTaxa": assoc_taxa,
+                            "reproductiveCondition": rep_cond,
                             "country": cntry,
                             "stateProvince": state_prov,
                             "county": county,
+                            "municipality": muni,
                             "locality": locality,
+                            "locationRemarks": loc_rem,
                             "decimalLatitude": dec_lat,
                             "decimalLongitude": dec_lon,
                             "verbatimCoordinates": verb_coord,
-                            "elevationInMeters": elev_single,
                             "minimumElevationInMeters": min_elev,
                             "maximumElevationInMeters": max_elev,
                             "verbatimElevation": verb_elev,
-                            "reproductiveCondition": rep_cond,
-                            "habitat": habitat,
-                            "substrate": substrate,
                             "verbatimLabel": verb_label,
                             "associatedMedia": new_filename,
                         }
