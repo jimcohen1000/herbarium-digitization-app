@@ -320,7 +320,7 @@ if st.session_state.image_paths:
 
         col1, col2 = st.columns([1, 1])
 
-        # Left Column: Full Image & Manual Cropper
+       # Left Column: Full Image & Manual Cropper
         with col1:
             st.caption(
                 "Full Specimen View. Draw blue box over barcode if auto-detect fails."
@@ -329,7 +329,7 @@ if st.session_state.image_paths:
                 image,
                 realtime_update=True,
                 box_color="#0000FF",
-                key="barcode_cropper",
+                key=f"cropper_{st.session_state.idx}",
                 return_type="box",
             )
 
