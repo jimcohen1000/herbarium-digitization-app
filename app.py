@@ -25,8 +25,8 @@ if "records" not in st.session_state:
     st.session_state.records = []
 if "idx" not in st.session_state:
     st.session_state.idx = 0
-if "last_parsed_idx" not in st.session_state:
-    st.session_state.last_parsed_idx = -1
+if "page_data" not in st.session_state:
+    st.session_state.page_data = {}  # Caches parsed/edited form data per image index
 if "image_paths" not in st.session_state:
     st.session_state.image_paths = []
 if "work_dir" not in st.session_state:
@@ -67,20 +67,23 @@ default_fields = {
     "verbatimLabel": "",
 }
 
-if "parsed_fields" not in st.session_state:
-    st.session_state.parsed_fields = default_fields.copy()
-
 # Sidebar Settings
 st.sidebar.header("1. Institutional Defaults")
 inst_code = st.sidebar.text_input("institutionCode", value="Weber State")
 coll_code = st.sidebar.text_input("collectionCode", value="WSCO")
 
-st.sidebar.header("2. Free API Key")
+st.sidebar.header("2. Free API Key & Processing")
 api_key = st.sidebar.text_input(
     "Gemini API Key (Free from AI Studio)",
     type="password",
     value=st.secrets.get("GEMINI_API_KEY", ""),
     help="Default key is loaded from secrets if available. Clear and type to override.",
+)
+
+auto_parse = st.sidebar.checkbox(
+    "⚡ Auto-parse image on load",
+    value=False,
+    help="Uncheck this to freely browse images without running Vision AI automatically.",
 )
 
 
@@ -271,38 +274,37 @@ if st.session_state.image_paths:
     if st.session_state.idx < total_imgs:
         img_path = st.session_state.image_paths[st.session_state.idx]
         image = Image.open(img_path)
+        current_idx = st.session_state.idx
 
-        # Automatic Vision AI Trigger on Image Load
-        if st.session_state.last_parsed_idx != st.session_state.idx:
-            if api_key:
+        # Initialize or fetch cached page data
+        if current_idx not in st.session_state.page_data:
+            if auto_parse and api_key:
                 with st.spinner(
-                    f"🤖 Auto-parsing specimen {st.session_state.idx + 1} with Vision AI..."
+                    f"🤖 Auto-parsing specimen {current_idx + 1} with Vision AI..."
                 ):
-                    st.session_state.parsed_fields = run_gemini_parser(
+                    st.session_state.page_data[current_idx] = run_gemini_parser(
                         image, api_key
                     )
-                    st.session_state.last_parsed_idx = st.session_state.idx
-                    st.rerun()
             else:
-                st.sidebar.warning(
-                    "⚠️ Enter Gemini API Key to enable auto-parsing."
+                st.session_state.page_data[current_idx] = (
+                    default_fields.copy()
                 )
 
-        # Toolbar
+        pf = st.session_state.page_data[current_idx]
+
+        # Navigation Toolbar
         nav1, nav2, nav3, nav4 = st.columns([2, 1, 1, 1])
         with nav1:
             st.markdown(
-                f"### Specimen {st.session_state.idx + 1} of {total_imgs}: `{os.path.basename(img_path)}`"
+                f"### Specimen {current_idx + 1} of {total_imgs}: `{os.path.basename(img_path)}`"
             )
         with nav2:
-            if st.button("⬅️ Previous") and st.session_state.idx > 0:
+            if st.button("⬅️ Previous") and current_idx > 0:
                 st.session_state.idx -= 1
-                st.session_state.parsed_fields = default_fields.copy()
                 st.rerun()
         with nav3:
-            if st.button("⏭️ Skip"):
+            if st.button("⏭️ Skip") and current_idx < total_imgs - 1:
                 st.session_state.idx += 1
-                st.session_state.parsed_fields = default_fields.copy()
                 st.rerun()
         with nav4:
             if st.button("↩️ Undo Last") and st.session_state.records:
@@ -313,14 +315,13 @@ if st.session_state.image_paths:
                 if os.path.exists(last_f):
                     os.remove(last_f)
                 st.session_state.idx = max(0, st.session_state.idx - 1)
-                st.session_state.parsed_fields = default_fields.copy()
                 st.rerun()
 
         st.divider()
 
         col1, col2 = st.columns([1, 1])
 
-       # Left Column: Full Image & Manual Cropper
+        # Left Column: Full Image & Dynamic Manual Cropper
         with col1:
             st.caption(
                 "Full Specimen View. Draw blue box over barcode if auto-detect fails."
@@ -329,14 +330,12 @@ if st.session_state.image_paths:
                 image,
                 realtime_update=True,
                 box_color="#0000FF",
-                key=f"cropper_{st.session_state.idx}",
+                key=f"cropper_{current_idx}",  # Dynamic key forces fresh render per specimen
                 return_type="box",
             )
 
         # Right Column: AI Zoom Crops & Form Inputs
         with col2:
-            pf = st.session_state.parsed_fields
-
             # Show Zoomed Crops when detected
             b_crop = crop_box_1000(image, pf.get("barcodeBox"))
             l_crop = crop_box_1000(image, pf.get("labelBox"))
@@ -382,17 +381,16 @@ if st.session_state.image_paths:
 
             st.markdown("#### 2. Vision AI Label Data")
 
-            if st.button("🔄 Re-Parse with Vision AI"):
+            if st.button("🔄 Run / Re-Parse with Vision AI"):
                 if not api_key:
                     st.error(
                         "Please enter a free Gemini API Key in the sidebar."
                     )
                 else:
-                    with st.spinner("Re-analyzing sheet with Vision AI..."):
-                        st.session_state.parsed_fields = run_gemini_parser(
-                            image, api_key
+                    with st.spinner("Analyzing sheet with Vision AI..."):
+                        st.session_state.page_data[current_idx] = (
+                            run_gemini_parser(image, api_key)
                         )
-                        st.session_state.last_parsed_idx = st.session_state.idx
                         st.rerun()
 
             # Taxonomy Section
@@ -546,43 +544,43 @@ if st.session_state.image_paths:
 
                     shutil.copy(img_path, dest_path)
 
-                    st.session_state.records.append(
-                        {
-                            "institutionCode": inst_code,
-                            "collectionCode": coll_code,
-                            "catalogNumber": cat_num,
-                            "scientificName": sci_name,
-                            "genus": genus,
-                            "specificEpithet": sp_ep,
-                            "recordedBy": rec_by,
-                            "recordNumber": rec_num,
-                            "eventDate": ev_date,
-                            "year": yr,
-                            "month": mo,
-                            "day": dy,
-                            "occurrenceRemarks": occ_rem,
-                            "habitat": habitat,
-                            "substrate": substrate,
-                            "associatedTaxa": assoc_taxa,
-                            "reproductiveCondition": rep_cond,
-                            "country": cntry,
-                            "stateProvince": state_prov,
-                            "county": county,
-                            "municipality": muni,
-                            "locality": locality,
-                            "locationRemarks": loc_rem,
-                            "decimalLatitude": dec_lat,
-                            "decimalLongitude": dec_lon,
-                            "verbatimCoordinates": verb_coord,
-                            "minimumElevationInMeters": min_elev,
-                            "maximumElevationInMeters": max_elev,
-                            "verbatimElevation": verb_elev,
-                            "verbatimLabel": verb_label,
-                            "associatedMedia": new_filename,
-                        }
-                    )
+                    rec_data = {
+                        "institutionCode": inst_code,
+                        "collectionCode": coll_code,
+                        "catalogNumber": cat_num,
+                        "scientificName": sci_name,
+                        "genus": genus,
+                        "specificEpithet": sp_ep,
+                        "recordedBy": rec_by,
+                        "recordNumber": rec_num,
+                        "eventDate": ev_date,
+                        "year": yr,
+                        "month": mo,
+                        "day": dy,
+                        "occurrenceRemarks": occ_rem,
+                        "habitat": habitat,
+                        "substrate": substrate,
+                        "associatedTaxa": assoc_taxa,
+                        "reproductiveCondition": rep_cond,
+                        "country": cntry,
+                        "stateProvince": state_prov,
+                        "county": county,
+                        "municipality": muni,
+                        "locality": locality,
+                        "locationRemarks": loc_rem,
+                        "decimalLatitude": dec_lat,
+                        "decimalLongitude": dec_lon,
+                        "verbatimCoordinates": verb_coord,
+                        "minimumElevationInMeters": min_elev,
+                        "maximumElevationInMeters": max_elev,
+                        "verbatimElevation": verb_elev,
+                        "verbatimLabel": verb_label,
+                        "associatedMedia": new_filename,
+                    }
 
-                    st.session_state.parsed_fields = default_fields.copy()
+                    st.session_state.records.append(rec_data)
+                    # Cache form fields for current image so navigating back reflects saved edits
+                    st.session_state.page_data[current_idx] = rec_data.copy()
                     st.session_state.idx += 1
                     st.rerun()
     else:
