@@ -20,6 +20,19 @@ st.set_page_config(
 )
 st.title("Herbarium Digitization Tool (Weber State WSCO)")
 
+# Secure Password Gate
+expected_password = st.secrets.get("APP_PASSWORD")
+
+if expected_password:
+    user_password = st.sidebar.text_input(
+        "Herbarium Team Password", type="password"
+    )
+    if user_password != expected_password:
+        st.warning(
+            "Please enter the team password in the sidebar to access the app."
+        )
+        st.stop()
+
 # Persistent Local Work Directories
 WORK_DIR = "./batch_input"
 OUT_DIR = "./batch_output"
