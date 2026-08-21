@@ -1,8 +1,8 @@
 import io
 import json
 import os
+import re
 import shutil
-import tempfile
 import zipfile
 import cv2
 from google import genai
@@ -18,7 +18,13 @@ import zxingcpp
 st.set_page_config(
     layout="wide", page_title="Herbarium Image-First Digitization"
 )
-st.title("Herbarium Digitization Tool (Free Vision AI)")
+st.title("Herbarium Digitization Tool (Weber State WSCO)")
+
+# Persistent Local Work Directories
+WORK_DIR = "./batch_input"
+OUT_DIR = "./batch_output"
+os.makedirs(WORK_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
 
 # Initialize Session State
 if "records" not in st.session_state:
@@ -26,13 +32,11 @@ if "records" not in st.session_state:
 if "idx" not in st.session_state:
     st.session_state.idx = 0
 if "page_data" not in st.session_state:
-    st.session_state.page_data = {}  # Caches parsed/edited form data per image index
+    st.session_state.page_data = (
+        {}
+    )  # Caches parsed/edited form data & barcodes per image
 if "image_paths" not in st.session_state:
     st.session_state.image_paths = []
-if "work_dir" not in st.session_state:
-    st.session_state.work_dir = tempfile.mkdtemp()
-if "out_dir" not in st.session_state:
-    st.session_state.out_dir = tempfile.mkdtemp()
 
 default_fields = {
     "catalogNumber": "",
@@ -74,7 +78,7 @@ coll_code = st.sidebar.text_input("collectionCode", value="WSCO")
 
 st.sidebar.header("2. Free API Key & Processing")
 api_key = st.sidebar.text_input(
-    "Gemini API Key (Free from AI Studio)",
+    "Gemini API Key",
     type="password",
     value=st.secrets.get("GEMINI_API_KEY", ""),
     help="Default key is loaded from secrets if available. Clear and type to override.",
@@ -82,14 +86,27 @@ api_key = st.sidebar.text_input(
 
 auto_parse = st.sidebar.checkbox(
     "⚡ Auto-parse image on load",
-    value=False,
-    help="Uncheck this to freely browse images without running Vision AI automatically.",
+    value=True,
+    help="Uncheck to browse images manually without calling Vision AI automatically.",
 )
+
+
+# Safe Zip Extraction Function (Zip-Slip Security Fix)
+def safe_extract_zip(zip_file, target_dir):
+    with zipfile.ZipFile(zip_file, "r") as zip_ref:
+        for member in zip_ref.infolist():
+            target_path = os.path.abspath(
+                os.path.join(target_dir, member.filename)
+            )
+            if not target_path.startswith(os.path.abspath(target_dir)):
+                raise Exception(
+                    "Security Error: Attempted Path Traversal in Zip File"
+                )
+            zip_ref.extract(member, target_dir)
 
 
 # Crop helper function for 0-1000 scale bounding boxes
 def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
-    """Crops an image given a [ymin, xmin, ymax, xmax] box normalized to 0-1000 scale."""
     if not box or len(box) != 4:
         return None
     try:
@@ -106,9 +123,8 @@ def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
     return None
 
 
-# Barcode Decoder: Crop directly from full-resolution source pixels
+# Barcode Decoder
 def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
-    """Slices original full-res pixels using relative crop coordinates and applies adaptive binarization."""
     target_img = img
 
     if crop_box and crop_box.get("width", 0) > 0:
@@ -116,11 +132,9 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
         top = int(crop_box["top"])
         right = int(crop_box["left"] + crop_box["width"])
         bottom = int(crop_box["top"] + crop_box["height"])
-
         target_img = img.crop((left, top, right, bottom))
 
     padded = ImageOps.expand(target_img, border=40, fill="white")
-
     cv_img = np.array(padded.convert("L"))
     binarized = cv2.adaptiveThreshold(
         cv_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
@@ -151,10 +165,8 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
 
 # Vision API Label Parser
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Google GenAI SDK to parse Darwin Core / Symbiota fields."""
     try:
         client = genai.Client(api_key=key)
-
         candidate_models = [
             "gemini-3.7-flash",
             "gemini-3.6-flash",
@@ -166,49 +178,28 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         Extract data into standard Symbiota / Darwin Core fields.
 
         STRICT STANDARDIZATION RULES:
-        1. COUNTRY: If the specimen is from the US, set "country" to EXACTLY "United States" (do NOT use "US", "USA", or "United States of America").
-        2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" (e.g. Pinus) and "specificEpithet" (e.g. ponderosa).
-        3. DATES: Extract "eventDate" (e.g. 1984-06-15). Also break out integer values for "year", "month", and "day" separately.
-        4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS or UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
-        5. ELEVATION: Extract "verbatimElevation" as printed. Convert numeric values to meters.
-           - If a single value is given (e.g., 1500 m or 5000 ft), set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that converted value in meters.
-           - If a range is given (e.g., 1500-1800 m), set min and max accordingly.
-        6. PHENOLOGY: Inspect the plant material for flowers, fruits, or cones. Assign "reproductiveCondition" to EXACTLY one of:
-           ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"].
-           - If unclear, unidentifiable, or ambiguous, leave as empty string ("").
+        1. COUNTRY: If the specimen is from the US, set "country" to EXACTLY "United States".
+        2. TAXONOMY: Extract "scientificName". Break out "genus" and "specificEpithet".
+        3. DATES: Extract "eventDate" (YYYY-MM-DD). Break out integer values for "year", "month", and "day".
+        4. COORDINATES: Convert DMS/UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". West/South must be negative numbers.
+        5. ELEVATION: Convert values to meters. If single value, set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" equal.
+        6. PHENOLOGY: Assign "reproductiveCondition" to EXACTLY one of: ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"]. Leave blank if unclear.
 
         Return ONLY a JSON object matching this schema:
         {
             "catalogNumber": "Extracted barcode or catalog ID number",
             "barcodeBox": [ymin, xmin, ymax, xmax],
             "labelBox": [ymin, xmin, ymax, xmax],
-            "scientificName": "Full taxon name including author if present",
-            "genus": "Genus name",
-            "specificEpithet": "Species epithet",
-            "recordedBy": "Collector name(s)",
-            "recordNumber": "Collector number",
-            "eventDate": "Collection date in YYYY-MM-DD or verbatim format",
-            "year": "4-digit year",
-            "month": "Numeric month (1-12) or 2-digit month string",
-            "day": "Numeric day (1-31) or 2-digit day string",
-            "occurrenceRemarks": "Plant description or specimen observations",
-            "habitat": "Habitat or community notes",
-            "substrate": "Soil, rock type, or growing medium notes",
-            "associatedTaxa": "Associated species list",
-            "reproductiveCondition": "Exact match from phenology terms or empty string",
-            "country": "Country name (must be 'United States' for US specimens)",
-            "stateProvince": "State or Province",
-            "county": "County or Parish",
-            "municipality": "City, town, or municipality",
-            "locality": "Detailed locality description",
-            "locationRemarks": "Additional location or access notes",
-            "decimalLatitude": "Numeric latitude in decimal degrees",
-            "decimalLongitude": "Numeric longitude in decimal degrees",
-            "verbatimCoordinates": "Raw coordinate string from label",
-            "minimumElevationInMeters": "Min elevation in meters (set equal to max if single value)",
-            "maximumElevationInMeters": "Max elevation in meters (set equal to min if single value)",
-            "verbatimElevation": "Raw elevation string as recorded on label",
-            "verbatimLabel": "Full exact verbatim label text"
+            "scientificName": "", "genus": "", "specificEpithet": "",
+            "recordedBy": "", "recordNumber": "", "eventDate": "",
+            "year": "", "month": "", "day": "", "occurrenceRemarks": "",
+            "habitat": "", "substrate": "", "associatedTaxa": "",
+            "reproductiveCondition": "", "country": "United States",
+            "stateProvince": "", "county": "", "municipality": "",
+            "locality": "", "locationRemarks": "", "decimalLatitude": "",
+            "decimalLongitude": "", "verbatimCoordinates": "",
+            "minimumElevationInMeters": "", "maximumElevationInMeters": "",
+            "verbatimElevation": "", "verbatimLabel": ""
         }
         """
 
@@ -233,14 +224,14 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
     except Exception as e:
         res = default_fields.copy()
-        res["verbatimLabel"] = f"API Error: {str(e)}"
+        res["verbatimLabel"] = f"API Parsing Error occurred: {str(e)}"
         return res
 
 
-# Sidebar: Upload Batch
+# Sidebar Upload Batch
 st.sidebar.header("3. Upload Batch")
 uploaded_files = st.sidebar.file_uploader(
-    "Upload ZIP archive or images (JPG, PNG, TIF)",
+    "Upload ZIP archive or images",
     type=["zip", "jpg", "jpeg", "png", "tif", "tiff"],
     accept_multiple_files=True,
 )
@@ -248,19 +239,16 @@ uploaded_files = st.sidebar.file_uploader(
 if uploaded_files and not st.session_state.image_paths:
     for uploaded_file in uploaded_files:
         if uploaded_file.name.lower().endswith(".zip"):
-            with zipfile.ZipFile(uploaded_file, "r") as zip_ref:
-                zip_ref.extractall(st.session_state.work_dir)
+            safe_extract_zip(uploaded_file, WORK_DIR)
         else:
-            file_path = os.path.join(
-                st.session_state.work_dir, uploaded_file.name
-            )
+            file_path = os.path.join(WORK_DIR, uploaded_file.name)
             with open(file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
     valid_exts = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
     paths = [
         os.path.join(root, f)
-        for root, _, files in os.walk(st.session_state.work_dir)
+        for root, _, files in os.walk(WORK_DIR)
         for f in files
         if f.lower().endswith(valid_exts)
     ]
@@ -276,23 +264,26 @@ if st.session_state.image_paths:
         image = Image.open(img_path)
         current_idx = st.session_state.idx
 
-        # Initialize or fetch cached page data
+        # CACHED INITIALIZATION: Run barcode scan & Vision AI ONCE per image index
         if current_idx not in st.session_state.page_data:
+            detected_barcode = decode_barcode_fullres(image)
+
             if auto_parse and api_key:
                 with st.spinner(
                     f"🤖 Auto-parsing specimen {current_idx + 1} with Vision AI..."
                 ):
-                    st.session_state.page_data[current_idx] = run_gemini_parser(
-                        image, api_key
-                    )
+                    parsed = run_gemini_parser(image, api_key)
+                    if not parsed.get("catalogNumber") and detected_barcode:
+                        parsed["catalogNumber"] = detected_barcode
+                    st.session_state.page_data[current_idx] = parsed
             else:
-                st.session_state.page_data[current_idx] = (
-                    default_fields.copy()
-                )
+                data = default_fields.copy()
+                data["catalogNumber"] = detected_barcode
+                st.session_state.page_data[current_idx] = data
 
         pf = st.session_state.page_data[current_idx]
 
-        # Navigation Toolbar
+        # Toolbar
         nav1, nav2, nav3, nav4 = st.columns([2, 1, 1, 1])
         with nav1:
             st.markdown(
@@ -309,9 +300,7 @@ if st.session_state.image_paths:
         with nav4:
             if st.button("↩️ Undo Last") and st.session_state.records:
                 last_rec = st.session_state.records.pop()
-                last_f = os.path.join(
-                    st.session_state.out_dir, last_rec["associatedMedia"]
-                )
+                last_f = os.path.join(OUT_DIR, last_rec["associatedMedia"])
                 if os.path.exists(last_f):
                     os.remove(last_f)
                 st.session_state.idx = max(0, st.session_state.idx - 1)
@@ -321,22 +310,19 @@ if st.session_state.image_paths:
 
         col1, col2 = st.columns([1, 1])
 
-        # Left Column: Full Image & Dynamic Manual Cropper
+        # Left Column: Image & Cropper
         with col1:
-            st.caption(
-                "Full Specimen View. Draw blue box over barcode if auto-detect fails."
-            )
+            st.caption("Full Specimen View. Draw box over barcode if needed.")
             barcode_box = st_cropper(
                 image,
                 realtime_update=True,
                 box_color="#0000FF",
-                key=f"cropper_{current_idx}",  # Dynamic key forces fresh render per specimen
+                key=f"cropper_{current_idx}",
                 return_type="box",
             )
 
-        # Right Column: AI Zoom Crops & Form Inputs
+        # Right Column: Data Entry Form
         with col2:
-            # Show Zoomed Crops when detected
             b_crop = crop_box_1000(image, pf.get("barcodeBox"))
             l_crop = crop_box_1000(image, pf.get("labelBox"))
 
@@ -347,66 +333,59 @@ if st.session_state.image_paths:
                     if b_crop:
                         st.image(
                             b_crop,
-                            caption="Detected Barcode Region",
+                            caption="Detected Barcode",
                             use_container_width=True,
                         )
                 with zcol2:
                     if l_crop:
                         st.image(
                             l_crop,
-                            caption="Detected Label Region",
+                            caption="Detected Label",
                             use_container_width=True,
                         )
                 st.divider()
 
             st.markdown("#### 1. Barcode Identification")
+            cat_num = st.text_input(
+                "Catalog Number (Barcode)", value=pf.get("catalogNumber", "")
+            )
 
-            auto_code = decode_barcode_fullres(image)
-            if not auto_code and pf.get("catalogNumber"):
-                auto_code = pf.get("catalogNumber")
-
-            cat_num = st.text_input("Catalog Number (Barcode)", value=auto_code)
-
-            if st.button("Read Barcode from Blue Crop Box"):
+            if st.button("Read Barcode from Manual Crop Box"):
                 cropped_code = decode_barcode_fullres(
                     image, crop_box=barcode_box
                 )
                 if cropped_code:
                     cat_num = cropped_code
+                    pf["catalogNumber"] = cropped_code
                     st.success(f"Detected: {cat_num}")
+                    st.rerun()
                 else:
                     st.error("No barcode detected in crop box. Enter manually.")
 
             st.divider()
 
             st.markdown("#### 2. Vision AI Label Data")
-
             if st.button("🔄 Run / Re-Parse with Vision AI"):
                 if not api_key:
-                    st.error(
-                        "Please enter a free Gemini API Key in the sidebar."
-                    )
+                    st.error("Please enter a Gemini API Key in sidebar.")
                 else:
                     with st.spinner("Analyzing sheet with Vision AI..."):
-                        st.session_state.page_data[current_idx] = (
-                            run_gemini_parser(image, api_key)
-                        )
+                        parsed = run_gemini_parser(image, api_key)
+                        st.session_state.page_data[current_idx] = parsed
                         st.rerun()
 
-            # Taxonomy Section
             st.markdown("##### 🌿 Taxonomy")
             sci_name = st.text_input(
                 "scientificName", value=pf.get("scientificName", "")
             )
-            tax_col1, tax_col2 = st.columns(2)
-            with tax_col1:
+            tax1, tax2 = st.columns(2)
+            with tax1:
                 genus = st.text_input("genus", value=pf.get("genus", ""))
-            with tax_col2:
+            with tax2:
                 sp_ep = st.text_input(
                     "specificEpithet", value=pf.get("specificEpithet", "")
                 )
 
-            # Collector & Event Details
             st.markdown("##### 👤 Collector & Event Date")
             c1, c2 = st.columns(2)
             with c1:
@@ -430,7 +409,6 @@ if st.session_state.image_paths:
             with d4:
                 dy = st.text_input("day", value=pf.get("day", ""))
 
-            # Geography & Locality
             st.markdown("##### 🗺️ Geography & Locality")
             g1, g2, g3, g4 = st.columns(4)
             with g1:
@@ -453,7 +431,6 @@ if st.session_state.image_paths:
                 "locationRemarks", value=pf.get("locationRemarks", "")
             )
 
-            # Coordinates, Elevation & Phenology
             st.markdown("##### 📍 Coordinates, Elevation & Phenology")
             loc_col1, loc_col2 = st.columns(2)
             with loc_col1:
@@ -480,7 +457,6 @@ if st.session_state.image_paths:
                     "verbatimElevation", value=pf.get("verbatimElevation", "")
                 )
 
-            # Phenology Dropdown
             symbiota_pheno_terms = [
                 "",
                 "In Flower",
@@ -492,7 +468,6 @@ if st.session_state.image_paths:
                 "Cones",
                 "Spores",
             ]
-
             gemini_pheno_pred = pf.get("reproductiveCondition", "").strip()
             pheno_idx = next(
                 (
@@ -507,10 +482,8 @@ if st.session_state.image_paths:
                 "reproductiveCondition",
                 options=symbiota_pheno_terms,
                 index=pheno_idx,
-                help="Symbiota controlled vocabulary for plant phenology stage.",
             )
 
-            # Remarks & Notes
             st.markdown("##### 📝 Habitat, Substrate & Remarks")
             rcol1, rcol2 = st.columns(2)
             with rcol1:
@@ -536,11 +509,11 @@ if st.session_state.image_paths:
                 if not cat_num:
                     st.error("Catalog Number is required before saving.")
                 else:
+                    # Sanitize catalog number for filesystem safety
+                    clean_cat = re.sub(r"[^\w\-]", "_", cat_num)
                     ext = os.path.splitext(img_path)[1]
-                    new_filename = f"{cat_num}{ext}"
-                    dest_path = os.path.join(
-                        st.session_state.out_dir, new_filename
-                    )
+                    new_filename = f"{clean_cat}{ext}"
+                    dest_path = os.path.join(OUT_DIR, new_filename)
 
                     shutil.copy(img_path, dest_path)
 
@@ -579,14 +552,13 @@ if st.session_state.image_paths:
                     }
 
                     st.session_state.records.append(rec_data)
-                    # Cache form fields for current image so navigating back reflects saved edits
                     st.session_state.page_data[current_idx] = rec_data.copy()
                     st.session_state.idx += 1
                     st.rerun()
     else:
         st.success("Batch processing complete!")
 
-# Live Symbiota Export Spreadsheet & Saved Image Review
+# Live Symbiota Export Spreadsheet
 st.divider()
 st.markdown("### 📊 Live Symbiota Import Spreadsheet")
 
@@ -598,8 +570,6 @@ if st.session_state.records:
         use_container_width=True,
         key="spreadsheet_editor",
     )
-
-    # Sync edits back to session state
     st.session_state.records = edited_df.to_dict("records")
 
     st.markdown("### 🖼️ Saved Specimen Record Viewer")
@@ -608,7 +578,7 @@ if st.session_state.records:
         for i, r in enumerate(st.session_state.records)
     ]
     selected_idx = st.selectbox(
-        "Select a saved record to inspect its image:",
+        "Select a saved record to inspect:",
         options=range(len(rec_labels)),
         format_func=lambda x: rec_labels[x],
     )
@@ -616,7 +586,7 @@ if st.session_state.records:
     if selected_idx < len(st.session_state.records):
         rec = st.session_state.records[selected_idx]
         img_name = rec.get("associatedMedia", "")
-        saved_img_path = os.path.join(st.session_state.out_dir, img_name)
+        saved_img_path = os.path.join(OUT_DIR, img_name)
 
         rcol1, rcol2 = st.columns([1, 1])
         with rcol1:
@@ -629,7 +599,6 @@ if st.session_state.records:
             else:
                 st.warning("Saved image file not found.")
         with rcol2:
-            st.markdown("**Saved Record Details**")
             st.json(rec)
 else:
     st.info("No records saved in current session.")
@@ -638,7 +607,10 @@ else:
 st.sidebar.header("4. Export Session Data")
 if st.session_state.records:
     export_df = pd.DataFrame(st.session_state.records)
-    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    # UTF-8 with BOM for native Windows Excel opening
+    csv_bytes = export_df.to_csv(index=False, encoding="utf-8-sig").encode(
+        "utf-8-sig"
+    )
 
     st.sidebar.download_button(
         label="📥 Download Symbiota CSV",
@@ -649,8 +621,8 @@ if st.session_state.records:
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zf:
-        for fname in os.listdir(st.session_state.out_dir):
-            fpath = os.path.join(st.session_state.out_dir, fname)
+        for fname in os.listdir(OUT_DIR):
+            fpath = os.path.join(OUT_DIR, fname)
             zf.write(fpath, fname)
 
     st.sidebar.download_button(
