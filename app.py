@@ -76,14 +76,17 @@ st.sidebar.header("1. Institutional Defaults")
 inst_code = st.sidebar.text_input("institutionCode", value="Weber State")
 coll_code = st.sidebar.text_input("collectionCode", value="WSCO")
 
-st.sidebar.header("2. Free API Key & Processing")
-api_key = st.sidebar.text_input(
-    "Gemini API Key",
+st.sidebar.header("2. Processing & API Key")
+
+# 1. Keep the input box blank by default so no secret is sent to the browser
+user_key = st.sidebar.text_input(
+    "Custom Gemini API Key (Optional)",
     type="password",
-    value=st.secrets.get("GEMINI_API_KEY", ""),
-    help="Default key is loaded from secrets if available. Clear and type to override.",
+    help="Leave blank to use the pre-configured default key.",
 )
 
+# 2. Silently pick the active key in Python behind the scenes
+api_key = user_key.strip() if user_key.strip() else st.secrets.get("GEMINI_API_KEY", "")
 auto_parse = st.sidebar.checkbox(
     "⚡ Auto-parse image on load",
     value=True,
