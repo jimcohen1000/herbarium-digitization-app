@@ -109,13 +109,11 @@ DEFAULT_DWC_RECORD = {
     "coordinateUncertaintyInMeters": "1000",
     "verbatimCoordinates": "",
     "geodeticDatum": "WGS84",
+    "elevationNumber": "",
     "minimumElevationInMeters": "",
     "maximumElevationInMeters": "",
     "verbatimElevation": "",
     "verbatimLabel": "",
-    "inputTokens": "0",
-    "outputTokens": "0",
-    "totalTokens": "0",
 }
 
 
@@ -177,7 +175,7 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
 
 
 def georeference_geolocate(locality: str, state: str, county: str):
-    """Queries the official GEOLocate Web API (built for natural history locality offset calculations)."""
+    """Queries GEOLocate Web API for offset calculations."""
     if not locality:
         return None
     url = (
@@ -216,7 +214,7 @@ def georeference_geolocate(locality: str, state: str, county: str):
 
 
 def georeference_arcgis(search_term: str, county: str, state: str):
-    """Queries ArcGIS Geocoder for physical features, USFS roads, and landmarks."""
+    """Queries ArcGIS Geocoder for landmarks, features, and roads."""
     if not search_term and not county:
         return None
     try:
@@ -257,7 +255,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         3. DATES: Extract "eventDate" (e.g. 1984-06-15). Break out "year", "month", and "day". Extract "verbatimEventDate" as written.
         4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS/UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
            IMPORTANT: If no numerical coordinates are printed on the label, leave BOTH "decimalLatitude" AND "decimalLongitude" as empty strings ("").
-        5. ELEVATION: Convert numeric values to meters. If a single value is given, set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that value.
+        5. ELEVATION: Convert numeric values to meters. 
+           - If a single elevation value is present (not a range), populate "elevationNumber" with that single value, and leave BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" as empty strings ("").
+           - If an elevation range is present (e.g., 2000-2500 m), leave "elevationNumber" as an empty string (""), set "minimumElevationInMeters" to the lower value, and "maximumElevationInMeters" to the upper value.
         6. PHENOLOGY: Assign "reproductiveCondition" to EXACTLY one of: ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"] or empty string.
         7. GEOCODING SEARCH TERM: Extract a clean, simple landmark or named place for geocoding (e.g. "Lee Valley Reservoir" or "Greer"). Omit distances/directions.
 
@@ -294,8 +294,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "decimalLatitude": "Numeric latitude in decimal degrees or empty string",
             "decimalLongitude": "Numeric longitude in decimal degrees or empty string",
             "verbatimCoordinates": "Raw coordinate string from label",
-            "minimumElevationInMeters": "Min elevation in meters",
-            "maximumElevationInMeters": "Max elevation in meters",
+            "elevationNumber": "Single elevation value in meters or empty string if range",
+            "minimumElevationInMeters": "Lower elevation in meters if range, else empty string",
+            "maximumElevationInMeters": "Upper elevation in meters if range, else empty string",
             "verbatimElevation": "Raw elevation string as recorded on label",
             "verbatimLabel": "Full exact verbatim label text"
         }
@@ -320,13 +321,13 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                         hasattr(response, "usage_metadata")
                         and response.usage_metadata
                     ):
-                        merged["inputTokens"] = str(
+                        merged["_inputTokens"] = str(
                             response.usage_metadata.prompt_token_count
                         )
-                        merged["outputTokens"] = str(
+                        merged["_outputTokens"] = str(
                             response.usage_metadata.candidates_token_count
                         )
-                        merged["totalTokens"] = str(
+                        merged["_totalTokens"] = str(
                             response.usage_metadata.total_token_count
                         )
 
@@ -345,25 +346,22 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
 
 def render_map_georeference(specimen_data, record_key="specimen"):
-    """Multi-tier georeferencer (GEOLocate API -> ArcGIS Geocoder) with isolated session rendering."""
+    """Multi-tier georeferencer with isolated session rendering."""
     lat_val = str(specimen_data.get("decimalLatitude", "")).strip()
     lon_val = str(specimen_data.get("decimalLongitude", "")).strip()
 
-    # Attempt Geocoding if coordinates are unpopulated
     if not lat_val or not lon_val:
         locality = specimen_data.get("locality", "").strip()
         state = specimen_data.get("stateProvince", "").strip()
         county = specimen_data.get("county", "").strip()
         search_term = specimen_data.get("geocodingSearchTerm", "").strip()
 
-        # Step 1: GEOLocate API (Handles locality strings & offsets like "7 mi SSW of Greer")
         gl_res = georeference_geolocate(locality, state, county)
         if gl_res:
             specimen_data["decimalLatitude"] = gl_res[0]
             specimen_data["decimalLongitude"] = gl_res[1]
             specimen_data["coordinateUncertaintyInMeters"] = gl_res[2]
         else:
-            # Step 2: ArcGIS (Superior for landmarks, reservoirs, USFS roads)
             ag_res = georeference_arcgis(
                 search_term or locality, county, state
             )
@@ -372,14 +370,13 @@ def render_map_georeference(specimen_data, record_key="specimen"):
                 specimen_data["decimalLongitude"] = ag_res[1]
                 specimen_data["coordinateUncertaintyInMeters"] = ag_res[2]
 
-    # Map display coordinates (Does NOT save defaults into specimen record)
     has_coords = False
     try:
         lat = float(specimen_data.get("decimalLatitude"))
         lon = float(specimen_data.get("decimalLongitude"))
         has_coords = True
     except (ValueError, TypeError):
-        lat, lon = 39.8283, -98.5795  # Geographic center of US for map view
+        lat, lon = 39.8283, -98.5795
 
     try:
         uncertainty = float(
@@ -593,9 +590,9 @@ if st.session_state.image_paths:
             # Token Metric Header & Vision Action
             st.markdown("#### 2. Vision AI Label Data")
 
-            in_tok = pf.get("inputTokens", "0")
-            out_tok = pf.get("outputTokens", "0")
-            tot_tok = pf.get("totalTokens", "0")
+            in_tok = pf.get("_inputTokens", "0")
+            out_tok = pf.get("_outputTokens", "0")
+            tot_tok = pf.get("_totalTokens", "0")
 
             st.info(
                 f"📊 **Token Metrics:** Prompt/Image: `{in_tok}` tokens | Output: `{out_tok}` tokens | **Total:** `{tot_tok}` tokens"
@@ -705,11 +702,16 @@ if st.session_state.image_paths:
                 )
                 render_map_georeference(pf, record_key=f"rec_{current_idx}")
 
+                verb_coord = st.text_input(
+                    "verbatimCoordinates",
+                    value=pf.get("verbatimCoordinates", ""),
+                )
+
                 lcol1, lcol2, lcol3 = st.columns(3)
                 with lcol1:
-                    verb_coord = st.text_input(
-                        "verbatimCoordinates",
-                        value=pf.get("verbatimCoordinates", ""),
+                    elev_num = st.text_input(
+                        "elevationNumber",
+                        value=pf.get("elevationNumber", ""),
                     )
                 with lcol2:
                     min_elev = st.text_input(
@@ -791,6 +793,7 @@ if st.session_state.image_paths:
 
                     shutil.copy(img_path, dest_path)
 
+                    # Export record explicitly excludes token metadata (_inputTokens, etc.)
                     rec_data = {
                         "institutionCode": inst_code,
                         "collectionCode": coll_code,
@@ -826,13 +829,11 @@ if st.session_state.image_paths:
                         ),
                         "geodeticDatum": "WGS84",
                         "verbatimCoordinates": verb_coord,
+                        "elevationNumber": elev_num,
                         "minimumElevationInMeters": min_elev,
                         "maximumElevationInMeters": max_elev,
                         "verbatimElevation": verb_elev,
                         "verbatimLabel": verb_label,
-                        "inputTokens": in_tok,
-                        "outputTokens": out_tok,
-                        "totalTokens": tot_tok,
                         "associatedMedia": new_filename,
                     }
 
