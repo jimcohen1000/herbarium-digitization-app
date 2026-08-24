@@ -11,3 +11,9 @@ pandas
 pillow
 google-genai
 zxing-cpp
+streamlit-folium
+folium
+geopy
+google-genai
+opencv-python-headless
+numpy
