@@ -6,13 +6,14 @@ import tempfile
 import zipfile
 import cv2
 import folium
-from geopy.geocoders import Nominatim
+from geopy.geocoders import ArcGIS
 from google import genai
 from google.genai import types
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
 from pyzbar.pyzbar import decode
+import requests
 import streamlit as st
 from streamlit_cropper import st_cropper
 from streamlit_folium import st_folium
@@ -119,7 +120,7 @@ DEFAULT_DWC_RECORD = {
 
 
 # -----------------------------------------------------------------------------
-# 3. HELPER FUNCTIONS
+# 3. HELPER FUNCTIONS & ADVANCED GEOCODING ENGINES
 # -----------------------------------------------------------------------------
 def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
     if not box or len(box) != 4:
@@ -175,6 +176,63 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
     return ""
 
 
+def georeference_geolocate(locality: str, state: str, county: str):
+    """Queries the official GEOLocate Web API (built for natural history locality offset calculations)."""
+    if not locality:
+        return None
+    url = (
+        "https://www.geo-locate.org/webservices/geolocatesvcs/glws.asmx/Georef2"
+    )
+    clean_county = (
+        county.replace(" County", "").replace(" Co.", "").strip()
+        if county
+        else ""
+    )
+    params = {
+        "locality": locality,
+        "state": state or "",
+        "county": clean_county,
+        "country": "United States",
+        "fmt": "json",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=6)
+        if resp.status_code == 200:
+            data = resp.json()
+            points = (
+                data.get("engine", {})
+                .get("result", {})
+                .get("resultSet", [])
+            )
+            if points:
+                top = points[0]
+                lat = str(round(float(top["WGS84Latitude"]), 6))
+                lon = str(round(float(top["WGS84Longitude"]), 6))
+                unc = str(int(top.get("UncertaintyRadiusmeters", 2500)))
+                return lat, lon, unc
+    except Exception:
+        pass
+    return None
+
+
+def georeference_arcgis(search_term: str, county: str, state: str):
+    """Queries ArcGIS Geocoder for physical features, USFS roads, and landmarks."""
+    if not search_term and not county:
+        return None
+    try:
+        geolocator = ArcGIS(user_agent="weber_state_herbarium_digitizer")
+        query_parts = [
+            p for p in [search_term, county, state, "United States"] if p
+        ]
+        query = ", ".join(query_parts)
+        loc = geolocator.geocode(query, timeout=5)
+        if loc:
+            return str(round(loc.latitude, 6)), str(round(loc.longitude, 6)), "3000"
+    except Exception:
+        pass
+    return None
+
+
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
@@ -198,7 +256,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" and "specificEpithet".
         3. DATES: Extract "eventDate" (e.g. 1984-06-15). Break out "year", "month", and "day". Extract "verbatimEventDate" as written.
         4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS/UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
-           IMPORTANT: If no numerical coordinates are printed on the label, set BOTH "decimalLatitude" AND "decimalLongitude" to empty string (""). DO NOT invent coordinates.
+           IMPORTANT: If no numerical coordinates are printed on the label, leave BOTH "decimalLatitude" AND "decimalLongitude" as empty strings ("").
         5. ELEVATION: Convert numeric values to meters. If a single value is given, set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that value.
         6. PHENOLOGY: Assign "reproductiveCondition" to EXACTLY one of: ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"] or empty string.
         7. GEOCODING SEARCH TERM: Extract a clean, simple landmark or named place for geocoding (e.g. "Lee Valley Reservoir" or "Greer"). Omit distances/directions.
@@ -287,78 +345,41 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
 
 def render_map_georeference(specimen_data, record_key="specimen"):
-    """Robust multi-tier geocoder using structured queries; avoids populating fallback coordinates into records."""
-    # 1. Attempt geocoding if lat/lon are not yet set
+    """Multi-tier georeferencer (GEOLocate API -> ArcGIS Geocoder) with isolated session rendering."""
     lat_val = str(specimen_data.get("decimalLatitude", "")).strip()
     lon_val = str(specimen_data.get("decimalLongitude", "")).strip()
 
+    # Attempt Geocoding if coordinates are unpopulated
     if not lat_val or not lon_val:
-        geolocator = Nominatim(user_agent="weber_state_herbarium_digitizer")
-        location = None
-
+        locality = specimen_data.get("locality", "").strip()
         state = specimen_data.get("stateProvince", "").strip()
-        county = (
-            specimen_data.get("county", "")
-            .replace(" County", "")
-            .replace(" Co.", "")
-            .strip()
-        )
-        country = specimen_data.get("country", "").strip()
+        county = specimen_data.get("county", "").strip()
         search_term = specimen_data.get("geocodingSearchTerm", "").strip()
-        muni = specimen_data.get("municipality", "").strip()
 
-        # Tier 1: Search landmark/term + state
-        if search_term and state:
-            try:
-                location = geolocator.geocode(
-                    f"{search_term}, {state}, {country}", timeout=4
-                )
-            except Exception:
-                pass
-
-        # Tier 2: Municipality / City + State
-        if not location and muni and state:
-            try:
-                location = geolocator.geocode(
-                    {"city": muni, "state": state, "country": country},
-                    timeout=4,
-                )
-            except Exception:
-                pass
-
-        # Tier 3: Structured County + State
-        if not location and county and state:
-            try:
-                location = geolocator.geocode(
-                    {"county": county, "state": state, "country": country},
-                    timeout=4,
-                )
-            except Exception:
-                pass
-
-        # Tier 4: State Level Fallback
-        if not location and state:
-            try:
-                location = geolocator.geocode(
-                    {"state": state, "country": country}, timeout=4
-                )
-            except Exception:
-                pass
-
-        if location:
-            specimen_data["decimalLatitude"] = str(round(location.latitude, 6))
-            specimen_data["decimalLongitude"] = str(
-                round(location.longitude, 6)
+        # Step 1: GEOLocate API (Handles locality strings & offsets like "7 mi SSW of Greer")
+        gl_res = georeference_geolocate(locality, state, county)
+        if gl_res:
+            specimen_data["decimalLatitude"] = gl_res[0]
+            specimen_data["decimalLongitude"] = gl_res[1]
+            specimen_data["coordinateUncertaintyInMeters"] = gl_res[2]
+        else:
+            # Step 2: ArcGIS (Superior for landmarks, reservoirs, USFS roads)
+            ag_res = georeference_arcgis(
+                search_term or locality, county, state
             )
+            if ag_res:
+                specimen_data["decimalLatitude"] = ag_res[0]
+                specimen_data["decimalLongitude"] = ag_res[1]
+                specimen_data["coordinateUncertaintyInMeters"] = ag_res[2]
 
-    # 2. Determine display coordinates for Folium (without corrupting specimen record)
+    # Map display coordinates (Does NOT save defaults into specimen record)
     has_coords = False
     try:
         lat = float(specimen_data.get("decimalLatitude"))
         lon = float(specimen_data.get("decimalLongitude"))
         has_coords = True
     except (ValueError, TypeError):
-        lat, lon = 39.8283, -98.5795  # Center of US for map view only
+        lat, lon = 39.8283, -98.5795  # Geographic center of US for map view
 
     try:
         uncertainty = float(
@@ -367,7 +388,7 @@ def render_map_georeference(specimen_data, record_key="specimen"):
     except (ValueError, TypeError):
         uncertainty = 1000.0
 
-    m = folium.Map(location=[lat, lon], zoom_start=9 if has_coords else 4)
+    m = folium.Map(location=[lat, lon], zoom_start=11 if has_coords else 4)
     folium.TileLayer(
         tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
         attr="OpenTopoMap",
@@ -396,10 +417,10 @@ def render_map_georeference(specimen_data, record_key="specimen"):
     )
 
     if map_response and map_response.get("last_clicked"):
-        lat = round(map_response["last_clicked"]["lat"], 6)
-        lon = round(map_response["last_clicked"]["lng"], 6)
-        specimen_data["decimalLatitude"] = str(lat)
-        specimen_data["decimalLongitude"] = str(lon)
+        lat_click = round(map_response["last_clicked"]["lat"], 6)
+        lon_click = round(map_response["last_clicked"]["lng"], 6)
+        specimen_data["decimalLatitude"] = str(lat_click)
+        specimen_data["decimalLongitude"] = str(lon_click)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -680,7 +701,7 @@ if st.session_state.image_paths:
                     )
 
                 st.caption(
-                    "📍 Interactive Georeferencing Map (Click terrain to set pin)"
+                    "📍 Interactive Georeferencing Map (Powered by GEOLocate & ArcGIS)"
                 )
                 render_map_georeference(pf, record_key=f"rec_{current_idx}")
 
