@@ -25,7 +25,6 @@ st.set_page_config(
     layout="wide", page_title="Herbarium Image-First Digitization (WSCO)"
 )
 
-# App Password Security Gate
 expected_password = st.secrets.get("APP_PASSWORD")
 if expected_password:
     user_password = st.sidebar.text_input(
@@ -37,7 +36,6 @@ if expected_password:
         )
         st.stop()
 
-# Institutional & API Key Settings
 st.sidebar.header("1. Institutional Defaults")
 inst_code = st.sidebar.text_input("institutionCode", value="Weber State")
 coll_code = st.sidebar.text_input("collectionCode", value="WSCO")
@@ -85,7 +83,6 @@ DEFAULT_DWC_RECORD = {
     "specificEpithet": "",
     "scientificNameAuthorship": "",
     "identifiedBy": "",
-    "dateIdentified": "",
     "recordedBy": "",
     "associatedCollectors": "",
     "recordNumber": "",
@@ -104,6 +101,7 @@ DEFAULT_DWC_RECORD = {
     "county": "",
     "municipality": "",
     "locality": "",
+    "geocodingSearchTerm": "",
     "locationRemarks": "",
     "decimalLatitude": "",
     "decimalLongitude": "",
@@ -114,14 +112,16 @@ DEFAULT_DWC_RECORD = {
     "maximumElevationInMeters": "",
     "verbatimElevation": "",
     "verbatimLabel": "",
+    "inputTokens": "0",
+    "outputTokens": "0",
+    "totalTokens": "0",
 }
 
 
 # -----------------------------------------------------------------------------
-# 3. HELPER FUNCTIONS: CROPPING, BARCODES, GEMINI & MAPS
+# 3. HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
-    """Crops an image given a [ymin, xmin, ymax, xmax] box normalized to 0-1000 scale."""
     if not box or len(box) != 4:
         return None
     try:
@@ -139,9 +139,7 @@ def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
 
 
 def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
-    """Slices original full-res pixels using relative crop coordinates and applies adaptive thresholding."""
     target_img = img
-
     if crop_box and crop_box.get("width", 0) > 0:
         left = int(crop_box["left"])
         top = int(crop_box["top"])
@@ -178,7 +176,6 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
 
 
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Uses Google GenAI SDK to parse full sheet images with detailed Darwin Core prompt rules."""
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
         res["verbatimLabel"] = "Error: Missing Gemini API Key."
@@ -197,18 +194,15 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         Extract data into standard Symbiota / Darwin Core fields.
 
         STRICT STANDARDIZATION RULES:
-        1. COUNTRY: If the specimen is from the US, set "country" to EXACTLY "United States" (do NOT use "US", "USA", or "United States of America").
-        2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" (e.g. Pinus) and "specificEpithet" (e.g. ponderosa).
-        3. DATES: Extract "eventDate" (e.g. 1984-06-15). Also break out integer values for "year", "month", and "day" separately. Extract "verbatimEventDate" as written.
-        4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS or UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
-        5. ELEVATION: Extract "verbatimElevation" as printed. Convert numeric values to meters.
-           - If a single value is given (e.g., 1500 m or 5000 ft), set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that converted value in meters.
-           - If a range is given (e.g., 1500-1800 m), set min and max accordingly.
-        6. PHENOLOGY: Inspect the plant material for flowers, fruits, or cones. Assign "reproductiveCondition" to EXACTLY one of:
-           ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"].
-           - If unclear, unidentifiable, or ambiguous, leave as empty string ("").
+        1. COUNTRY: If the specimen is from the US, set "country" to EXACTLY "United States".
+        2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" and "specificEpithet".
+        3. DATES: Extract "eventDate" (e.g. 1984-06-15). Break out "year", "month", and "day". Extract "verbatimEventDate" as written.
+        4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS/UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
+        5. ELEVATION: Convert numeric values to meters. If a single value is given, set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that value.
+        6. PHENOLOGY: Assign "reproductiveCondition" to EXACTLY one of: ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"] or empty string.
+        7. GEOCODING SEARCH TERM: Extract a clean, simplified landmark name for geocoding (e.g. "Lee Valley Reservoir" or "Mount Baldy Wilderness"). Do NOT include distances/directions like "ca. 1-3 mi. W of".
 
-        Return ONLY a JSON object matching this schema:
+        Return ONLY a JSON object:
         {
             "catalogNumber": "Extracted barcode or catalog ID number",
             "barcodeBox": [ymin, xmin, ymax, xmax],
@@ -228,15 +222,16 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "day": "Numeric day (1-31)",
             "occurrenceRemarks": "Plant description or specimen observations",
             "habitat": "Habitat or community notes",
-            "substrate": "Soil, rock type, or growing medium notes",
+            "substrate": "Soil or growing medium notes",
             "associatedTaxa": "Associated species list",
             "reproductiveCondition": "Exact match from phenology terms or empty string",
-            "country": "Country name (must be 'United States' for US specimens)",
+            "country": "Country name",
             "stateProvince": "State or Province",
             "county": "County or Parish",
             "municipality": "City, town, or municipality",
             "locality": "Detailed locality description",
-            "locationRemarks": "Additional location or access notes",
+            "geocodingSearchTerm": "Simplified landmark name for geocoding",
+            "locationRemarks": "Additional location notes",
             "decimalLatitude": "Numeric latitude in decimal degrees",
             "decimalLongitude": "Numeric longitude in decimal degrees",
             "verbatimCoordinates": "Raw coordinate string from label",
@@ -261,6 +256,22 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                     parsed = json.loads(response.text)
                     merged = DEFAULT_DWC_RECORD.copy()
                     merged.update(parsed)
+
+                    # Capture API Token Consumption Metadata
+                    if (
+                        hasattr(response, "usage_metadata")
+                        and response.usage_metadata
+                    ):
+                        merged["inputTokens"] = str(
+                            response.usage_metadata.prompt_token_count
+                        )
+                        merged["outputTokens"] = str(
+                            response.usage_metadata.candidates_token_count
+                        )
+                        merged["totalTokens"] = str(
+                            response.usage_metadata.total_token_count
+                        )
+
                     return merged
             except Exception as err:
                 last_error = err
@@ -276,19 +287,31 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
 
 def render_map_georeference(specimen_data, record_key="specimen"):
-    """Auto-geocodes locality text and renders an interactive verification map with uncertainty radius."""
-    if not specimen_data.get("decimalLatitude") and specimen_data.get(
-        "locality"
-    ):
+    """Tiered Geocoder: Prevents Utah default by falling back gracefully from Landmark -> County -> State."""
+    if not specimen_data.get("decimalLatitude"):
         try:
             geolocator = Nominatim(user_agent="weber_state_herbarium_digitizer")
-            q_parts = [
-                specimen_data.get("locality", ""),
-                specimen_data.get("county", ""),
-                specimen_data.get("stateProvince", ""),
-            ]
-            query = ", ".join([p for p in q_parts if p])
-            location = geolocator.geocode(query, timeout=4)
+            location = None
+            state = specimen_data.get("stateProvince", "")
+            county = specimen_data.get("county", "")
+            country = specimen_data.get("country", "")
+            search_term = specimen_data.get("geocodingSearchTerm", "")
+
+            # Tier 1: Simplified Landmark + County + State
+            if search_term:
+                query = f"{search_term}, {county} County, {state}, {country}"
+                location = geolocator.geocode(query, timeout=4)
+
+            # Tier 2: County + State
+            if not location and county:
+                query = f"{county} County, {state}, {country}"
+                location = geolocator.geocode(query, timeout=4)
+
+            # Tier 3: State Level Fallback
+            if not location and state:
+                query = f"{state}, {country}"
+                location = geolocator.geocode(query, timeout=4)
+
             if location:
                 specimen_data["decimalLatitude"] = str(
                     round(location.latitude, 6)
@@ -299,6 +322,7 @@ def render_map_georeference(specimen_data, record_key="specimen"):
         except Exception:
             pass
 
+    # Coordinates Fallback
     try:
         lat = float(specimen_data.get("decimalLatitude", 41.2230))
         lon = float(specimen_data.get("decimalLongitude", -111.9738))
@@ -312,7 +336,7 @@ def render_map_georeference(specimen_data, record_key="specimen"):
     except (ValueError, TypeError):
         uncertainty = 1000.0
 
-    m = folium.Map(location=[lat, lon], zoom_start=11)
+    m = folium.Map(location=[lat, lon], zoom_start=10)
     folium.TileLayer(
         tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
         attr="OpenTopoMap",
@@ -406,7 +430,6 @@ if st.session_state.image_paths:
         image = ImageOps.exif_transpose(image)
         current_idx = st.session_state.idx
 
-        # Initialize or fetch cached page data
         if current_idx not in st.session_state.page_data:
             if auto_parse and API_KEY:
                 with st.spinner(
@@ -440,7 +463,8 @@ if st.session_state.image_paths:
             if st.button("↩️ Undo Last") and st.session_state.records:
                 last_rec = st.session_state.records.pop()
                 last_f = os.path.join(
-                    st.session_state.out_dir, last_rec.get("associatedMedia", "")
+                    st.session_state.out_dir,
+                    last_rec.get("associatedMedia", ""),
                 )
                 if os.path.exists(last_f):
                     os.remove(last_f)
@@ -451,7 +475,6 @@ if st.session_state.image_paths:
 
         col_left, col_right = st.columns([1, 1])
 
-        # Left Column: Image Viewer & Dynamic Cropper
         with col_left:
             st.caption(
                 "Full Specimen Sheet. Draw a blue crop box over barcode if manual detection is required."
@@ -464,7 +487,6 @@ if st.session_state.image_paths:
                 return_type="box",
             )
 
-        # Right Column: AI Crops & Multi-Tab Darwin Core Editing
         with col_right:
             b_crop = crop_box_1000(image, pf.get("barcodeBox"))
             l_crop = crop_box_1000(image, pf.get("labelBox"))
@@ -488,7 +510,6 @@ if st.session_state.image_paths:
                         )
                 st.divider()
 
-            # Barcode Identification Controls
             st.markdown("#### 1. Barcode Identification")
             auto_code = decode_barcode_fullres(image)
             if not auto_code and pf.get("catalogNumber"):
@@ -509,8 +530,17 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            # Vision AI Execution Button
+            # Token Metric Header & Vision Action
             st.markdown("#### 2. Vision AI Label Data")
+
+            in_tok = pf.get("inputTokens", "0")
+            out_tok = pf.get("outputTokens", "0")
+            tot_tok = pf.get("totalTokens", "0")
+
+            st.info(
+                f"📊 **Token Consumption Metrics:** Prompt/Image: `{in_tok}` tokens | Output: `{out_tok}` tokens | **Total:** `{tot_tok}` tokens"
+            )
+
             if st.button("🔄 Run / Re-Parse with Vision AI", type="primary"):
                 if not API_KEY:
                     st.error(
@@ -523,7 +553,6 @@ if st.session_state.image_paths:
                         )
                         st.rerun()
 
-            # Darwin Core Verification Tabs
             tabs = st.tabs(
                 [
                     "Taxonomy",
@@ -741,6 +770,9 @@ if st.session_state.image_paths:
                         "maximumElevationInMeters": max_elev,
                         "verbatimElevation": verb_elev,
                         "verbatimLabel": verb_label,
+                        "inputTokens": in_tok,
+                        "outputTokens": out_tok,
+                        "totalTokens": tot_tok,
                         "associatedMedia": new_filename,
                     }
 
@@ -797,9 +829,7 @@ if st.session_state.records:
             st.markdown("**Saved Darwin Core Fields**")
             st.json(rec)
 else:
-    st.info(
-        "No saved records in current session. Upload images and process specimens to build your export."
-    )
+    st.info("No saved records in current session.")
 
 # Sidebar Exports
 st.sidebar.header("4. Export Session Data")
