@@ -198,9 +198,10 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" and "specificEpithet".
         3. DATES: Extract "eventDate" (e.g. 1984-06-15). Break out "year", "month", and "day". Extract "verbatimEventDate" as written.
         4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS/UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
+           IMPORTANT: If no numerical coordinates are printed on the label, set BOTH "decimalLatitude" AND "decimalLongitude" to empty string (""). DO NOT invent coordinates.
         5. ELEVATION: Convert numeric values to meters. If a single value is given, set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that value.
         6. PHENOLOGY: Assign "reproductiveCondition" to EXACTLY one of: ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"] or empty string.
-        7. GEOCODING SEARCH TERM: Extract a clean, simplified landmark name for geocoding (e.g. "Lee Valley Reservoir" or "Mount Baldy Wilderness"). Do NOT include distances/directions like "ca. 1-3 mi. W of".
+        7. GEOCODING SEARCH TERM: Extract a clean, simple landmark or named place for geocoding (e.g. "Lee Valley Reservoir" or "Greer"). Omit distances/directions.
 
         Return ONLY a JSON object:
         {
@@ -232,8 +233,8 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "locality": "Detailed locality description",
             "geocodingSearchTerm": "Simplified landmark name for geocoding",
             "locationRemarks": "Additional location notes",
-            "decimalLatitude": "Numeric latitude in decimal degrees",
-            "decimalLongitude": "Numeric longitude in decimal degrees",
+            "decimalLatitude": "Numeric latitude in decimal degrees or empty string",
+            "decimalLongitude": "Numeric longitude in decimal degrees or empty string",
             "verbatimCoordinates": "Raw coordinate string from label",
             "minimumElevationInMeters": "Min elevation in meters",
             "maximumElevationInMeters": "Max elevation in meters",
@@ -257,7 +258,6 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                     merged = DEFAULT_DWC_RECORD.copy()
                     merged.update(parsed)
 
-                    # Capture API Token Consumption Metadata
                     if (
                         hasattr(response, "usage_metadata")
                         and response.usage_metadata
@@ -287,47 +287,78 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
 
 def render_map_georeference(specimen_data, record_key="specimen"):
-    """Tiered Geocoder: Prevents Utah default by falling back gracefully from Landmark -> County -> State."""
-    if not specimen_data.get("decimalLatitude"):
-        try:
-            geolocator = Nominatim(user_agent="weber_state_herbarium_digitizer")
-            location = None
-            state = specimen_data.get("stateProvince", "")
-            county = specimen_data.get("county", "")
-            country = specimen_data.get("country", "")
-            search_term = specimen_data.get("geocodingSearchTerm", "")
+    """Robust multi-tier geocoder using structured queries; avoids populating fallback coordinates into records."""
+    # 1. Attempt geocoding if lat/lon are not yet set
+    lat_val = str(specimen_data.get("decimalLatitude", "")).strip()
+    lon_val = str(specimen_data.get("decimalLongitude", "")).strip()
 
-            # Tier 1: Simplified Landmark + County + State
-            if search_term:
-                query = f"{search_term}, {county} County, {state}, {country}"
-                location = geolocator.geocode(query, timeout=4)
+    if not lat_val or not lon_val:
+        geolocator = Nominatim(user_agent="weber_state_herbarium_digitizer")
+        location = None
 
-            # Tier 2: County + State
-            if not location and county:
-                query = f"{county} County, {state}, {country}"
-                location = geolocator.geocode(query, timeout=4)
+        state = specimen_data.get("stateProvince", "").strip()
+        county = (
+            specimen_data.get("county", "")
+            .replace(" County", "")
+            .replace(" Co.", "")
+            .strip()
+        )
+        country = specimen_data.get("country", "").strip()
+        search_term = specimen_data.get("geocodingSearchTerm", "").strip()
+        muni = specimen_data.get("municipality", "").strip()
 
-            # Tier 3: State Level Fallback
-            if not location and state:
-                query = f"{state}, {country}"
-                location = geolocator.geocode(query, timeout=4)
-
-            if location:
-                specimen_data["decimalLatitude"] = str(
-                    round(location.latitude, 6)
+        # Tier 1: Search landmark/term + state
+        if search_term and state:
+            try:
+                location = geolocator.geocode(
+                    f"{search_term}, {state}, {country}", timeout=4
                 )
-                specimen_data["decimalLongitude"] = str(
-                    round(location.longitude, 6)
-                )
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-    # Coordinates Fallback
+        # Tier 2: Municipality / City + State
+        if not location and muni and state:
+            try:
+                location = geolocator.geocode(
+                    {"city": muni, "state": state, "country": country},
+                    timeout=4,
+                )
+            except Exception:
+                pass
+
+        # Tier 3: Structured County + State
+        if not location and county and state:
+            try:
+                location = geolocator.geocode(
+                    {"county": county, "state": state, "country": country},
+                    timeout=4,
+                )
+            except Exception:
+                pass
+
+        # Tier 4: State Level Fallback
+        if not location and state:
+            try:
+                location = geolocator.geocode(
+                    {"state": state, "country": country}, timeout=4
+                )
+            except Exception:
+                pass
+
+        if location:
+            specimen_data["decimalLatitude"] = str(round(location.latitude, 6))
+            specimen_data["decimalLongitude"] = str(
+                round(location.longitude, 6)
+            )
+
+    # 2. Determine display coordinates for Folium (without corrupting specimen record)
+    has_coords = False
     try:
-        lat = float(specimen_data.get("decimalLatitude", 41.2230))
-        lon = float(specimen_data.get("decimalLongitude", -111.9738))
+        lat = float(specimen_data.get("decimalLatitude"))
+        lon = float(specimen_data.get("decimalLongitude"))
+        has_coords = True
     except (ValueError, TypeError):
-        lat, lon = 41.2230, -111.9738
+        lat, lon = 39.8283, -98.5795  # Center of US for map view only
 
     try:
         uncertainty = float(
@@ -336,28 +367,29 @@ def render_map_georeference(specimen_data, record_key="specimen"):
     except (ValueError, TypeError):
         uncertainty = 1000.0
 
-    m = folium.Map(location=[lat, lon], zoom_start=10)
+    m = folium.Map(location=[lat, lon], zoom_start=9 if has_coords else 4)
     folium.TileLayer(
         tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
         attr="OpenTopoMap",
         name="Topographic",
     ).add_to(m)
 
-    folium.Marker(
-        [lat, lon],
-        popup=f"Coordinates: {lat}, {lon}",
-        icon=folium.Icon(color="red", icon="info-sign"),
-    ).add_to(m)
+    if has_coords:
+        folium.Marker(
+            [lat, lon],
+            popup=f"Coordinates: {lat}, {lon}",
+            icon=folium.Icon(color="red", icon="info-sign"),
+        ).add_to(m)
 
-    folium.Circle(
-        location=[lat, lon],
-        radius=uncertainty,
-        color="#3186cc",
-        fill=True,
-        fill_color="#3186cc",
-        fill_opacity=0.2,
-        popup=f"Uncertainty: {int(uncertainty)} m",
-    ).add_to(m)
+        folium.Circle(
+            location=[lat, lon],
+            radius=uncertainty,
+            color="#3186cc",
+            fill=True,
+            fill_color="#3186cc",
+            fill_opacity=0.2,
+            popup=f"Uncertainty: {int(uncertainty)} m",
+        ).add_to(m)
 
     map_response = st_folium(
         m, height=280, use_container_width=True, key=f"map_{record_key}"
@@ -371,19 +403,26 @@ def render_map_georeference(specimen_data, record_key="specimen"):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        specimen_data["decimalLatitude"] = st.text_input(
-            "Latitude", value=str(lat), key=f"lat_in_{record_key}"
+        in_lat = st.text_input(
+            "Latitude",
+            value=specimen_data.get("decimalLatitude", ""),
+            key=f"lat_in_{record_key}",
         )
+        specimen_data["decimalLatitude"] = in_lat.strip()
     with c2:
-        specimen_data["decimalLongitude"] = st.text_input(
-            "Longitude", value=str(lon), key=f"lon_in_{record_key}"
+        in_lon = st.text_input(
+            "Longitude",
+            value=specimen_data.get("decimalLongitude", ""),
+            key=f"lon_in_{record_key}",
         )
+        specimen_data["decimalLongitude"] = in_lon.strip()
     with c3:
-        specimen_data["coordinateUncertaintyInMeters"] = st.text_input(
+        in_unc = st.text_input(
             "Uncertainty (m)",
             value=str(int(uncertainty)),
             key=f"unc_in_{record_key}",
         )
+        specimen_data["coordinateUncertaintyInMeters"] = in_unc.strip()
 
 
 # -----------------------------------------------------------------------------
@@ -538,7 +577,7 @@ if st.session_state.image_paths:
             tot_tok = pf.get("totalTokens", "0")
 
             st.info(
-                f"📊 **Token Consumption Metrics:** Prompt/Image: `{in_tok}` tokens | Output: `{out_tok}` tokens | **Total:** `{tot_tok}` tokens"
+                f"📊 **Token Metrics:** Prompt/Image: `{in_tok}` tokens | Output: `{out_tok}` tokens | **Total:** `{tot_tok}` tokens"
             )
 
             if st.button("🔄 Run / Re-Parse with Vision AI", type="primary"):
