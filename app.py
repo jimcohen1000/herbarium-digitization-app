@@ -27,7 +27,7 @@ st.set_page_config(
     layout="wide", page_title="Herbarium Image-First Digitization (WSCO)"
 )
 
-# Sticky pin for the left column (Specimen image viewer & cropping panel)
+# Pin left column (Specimen image viewer) while right form scrolls independently
 st.markdown(
     """
     <style>
@@ -77,13 +77,13 @@ auto_parse = st.sidebar.checkbox(
 )
 
 # -----------------------------------------------------------------------------
-# 2. SESSION PERSISTENCE & DISK AUTOSAVE ENGINE
+# 2. DISK CACHE & SESSION PURGE ENGINE
 # -----------------------------------------------------------------------------
 AUTOSAVE_FILE = os.path.join(tempfile.gettempdir(), "wsco_herbarium_autosave.json")
 
 
 def save_autosave():
-    """Protects active state from browser refreshes by mirroring data to disk cache."""
+    """Writes session state to disk cache."""
     try:
         data = {
             "records": st.session_state.get("records", []),
@@ -100,13 +100,31 @@ def save_autosave():
         pass
 
 
-def clear_autosave():
+def purge_all_session_data():
+    """Completely wipes session memory and temporary disk image directories."""
     if os.path.exists(AUTOSAVE_FILE):
         try:
             os.remove(AUTOSAVE_FILE)
         except Exception:
             pass
 
+    if "work_dir" in st.session_state and os.path.exists(st.session_state.work_dir):
+        shutil.rmtree(st.session_state.work_dir, ignore_errors=True)
+    if "out_dir" in st.session_state and os.path.exists(st.session_state.out_dir):
+        shutil.rmtree(st.session_state.out_dir, ignore_errors=True)
+
+    st.session_state.work_dir = tempfile.mkdtemp()
+    st.session_state.out_dir = tempfile.mkdtemp()
+    st.session_state.records = []
+    st.session_state.idx = 0
+    st.session_state.page_data = {}
+    st.session_state.image_paths = []
+
+
+if "work_dir" not in st.session_state:
+    st.session_state.work_dir = tempfile.mkdtemp()
+if "out_dir" not in st.session_state:
+    st.session_state.out_dir = tempfile.mkdtemp()
 
 if "records" not in st.session_state:
     if os.path.exists(AUTOSAVE_FILE):
@@ -120,20 +138,12 @@ if "records" not in st.session_state:
             }
             st.session_state.image_paths = saved.get("image_paths", [])
         except Exception:
-            st.session_state.records = []
-            st.session_state.idx = 0
-            st.session_state.page_data = {}
-            st.session_state.image_paths = []
+            purge_all_session_data()
     else:
         st.session_state.records = []
         st.session_state.idx = 0
         st.session_state.page_data = {}
         st.session_state.image_paths = []
-
-if "work_dir" not in st.session_state:
-    st.session_state.work_dir = tempfile.mkdtemp()
-if "out_dir" not in st.session_state:
-    st.session_state.out_dir = tempfile.mkdtemp()
 
 
 # -----------------------------------------------------------------------------
@@ -184,10 +194,9 @@ DEFAULT_DWC_RECORD["geodeticDatum"] = "WGS84"
 
 
 # -----------------------------------------------------------------------------
-# 4. HELPER FUNCTIONS & PARSING ENGINES
+# 4. HELPER FUNCTIONS & GEOPROCESSING
 # -----------------------------------------------------------------------------
 def crop_box_1000(img: Image.Image, box) -> Image.Image:
-    """Handles both Gemini [ymin, xmin, ymax, xmax] lists and st_cropper dicts."""
     if not box:
         return None
     try:
@@ -327,7 +336,6 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                 )
 
                 parsed_data = None
-                # Check for SDK parsed object
                 if hasattr(response, "parsed") and response.parsed:
                     if isinstance(response.parsed, BaseModel):
                         parsed_data = response.parsed.model_dump()
@@ -345,10 +353,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                     merged = DEFAULT_DWC_RECORD.copy()
                     merged.update(parsed_data)
 
-                    if (
-                        hasattr(response, "usage_metadata")
-                        and response.usage_metadata
-                    ):
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
                         merged["_inputTokens"] = str(
                             response.usage_metadata.prompt_token_count or 0
                         )
@@ -469,13 +474,19 @@ def render_map_georeference(specimen_data, record_key="specimen"):
 
 
 # -----------------------------------------------------------------------------
-# 5. BATCH UPLOAD MANAGEMENT
+# 5. BATCH UPLOAD MANAGEMENT & PURGE CONTROL
 # -----------------------------------------------------------------------------
 st.sidebar.header("3. Upload Batch")
+
+if st.sidebar.button("🧹 Clear All Previous Images & Start Fresh"):
+    purge_all_session_data()
+    st.rerun()
+
 uploaded_files = st.sidebar.file_uploader(
     "Upload ZIP archive or images (JPG, PNG, TIF)",
     type=["zip", "jpg", "jpeg", "png", "tif", "tiff"],
     accept_multiple_files=True,
+    key="specimen_uploader",
 )
 
 if uploaded_files and not st.session_state.image_paths:
@@ -941,11 +952,3 @@ if st.session_state.records:
         file_name="renamed_specimens.zip",
         mime="application/zip",
     )
-
-if st.sidebar.button("🗑️ Reset Batch & Clear Autosave Cache"):
-    clear_autosave()
-    st.session_state.records = []
-    st.session_state.idx = 0
-    st.session_state.page_data = {}
-    st.session_state.image_paths = []
-    st.rerun()
