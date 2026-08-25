@@ -311,10 +311,10 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         return res
 
     try:
-        # Convert image to standard JPEG bytes
+        # 1. Convert image to RGB JPEG bytes (handles TIF, PNG, RGBA)
         img_converted = img.convert("RGB")
         buf = io.BytesIO()
-        img_converted.save(buf, format="JPEG", quality=90)
+        img_converted.save(buf, format="JPEG", quality=85)
         img_bytes = buf.getvalue()
 
         image_part = types.Part.from_bytes(
@@ -326,16 +326,16 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         prompt = (
             "You are an expert botanical taxonomist and herbarium digitizer. "
-            "Examine this specimen sheet and extract all visible text into the requested JSON schema. "
+            "Examine this specimen sheet and extract all visible text into the requested schema. "
             "Extract the primary label data, scientific name, collector, dates, location, and barcode numbers."
         )
 
-        # Supported flash models in order of preference
-        candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash"]
+        candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
         
-        response = None
-        last_error = None
-        
+        parsed_data = None
+        last_error_msg = ""
+
+        # Tier 1: Try structured output with Pydantic schema enforcement
         for model_name in candidate_models:
             try:
                 response = client.models.generate_content(
@@ -347,37 +347,71 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                         temperature=0.1,
                     ),
                 )
-                if response:
-                    break
+
+                # Check Pydantic parsed output
+                if hasattr(response, "parsed") and response.parsed:
+                    if isinstance(response.parsed, BaseModel):
+                        parsed_data = response.parsed.model_dump()
+                        break
+                    elif isinstance(response.parsed, dict):
+                        parsed_data = response.parsed
+                        break
+
+                # Fallback to response text
+                if hasattr(response, "text") and response.text:
+                    clean_text = response.text.replace("```json", "").replace("```", "").strip()
+                    if clean_text:
+                        parsed_data = json.loads(clean_text)
+                        break
+
+                # Record diagnostic info if no content returned
+                if hasattr(response, "candidates") and response.candidates:
+                    finish_reason = response.candidates[0].finish_reason
+                    last_error_msg = f"{model_name} stopped with finish_reason: {finish_reason}"
+                else:
+                    last_error_msg = f"{model_name} returned no candidates."
+
             except Exception as err:
-                last_error = err
+                last_error_msg = str(err)
                 continue
 
-        if not response:
-            raise last_error or ValueError("All model attempts failed.")
-
-        parsed_data = None
-        if hasattr(response, "parsed") and response.parsed:
-            if isinstance(response.parsed, BaseModel):
-                parsed_data = response.parsed.model_dump()
-            elif isinstance(response.parsed, dict):
-                parsed_data = response.parsed
-        elif response and response.text:
-            clean_text = response.text.replace("```json", "").replace("```", "").strip()
-            parsed_data = json.loads(clean_text)
+        # Tier 2: Fallback to unconstrained JSON mode if Pydantic validation rejected the response
+        if not parsed_data:
+            for model_name in candidate_models:
+                try:
+                    json_prompt = (
+                        f"{prompt}\n\nReturn a valid JSON object matching standard Darwin Core fields: "
+                        "catalogNumber, scientificName, genus, specificEpithet, recordedBy, eventDate, locality, country, stateProvince, county, verbatimLabel."
+                    )
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[json_prompt, image_part],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.1,
+                        ),
+                    )
+                    if hasattr(response, "text") and response.text:
+                        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+                        if clean_text:
+                            parsed_data = json.loads(clean_text)
+                            break
+                except Exception as err:
+                    last_error_msg = str(err)
+                    continue
 
         if parsed_data:
             merged = DEFAULT_DWC_RECORD.copy()
             merged.update(parsed_data)
 
             if hasattr(response, "usage_metadata") and response.usage_metadata:
-                merged["_inputTokens"] = str(response.usage_metadata.prompt_token_count or 0)
-                merged["_outputTokens"] = str(response.usage_metadata.candidates_token_count or 0)
-                merged["_totalTokens"] = str(response.usage_metadata.total_token_count or 0)
+                merged["_inputTokens"] = str(getattr(response.usage_metadata, "prompt_token_count", 0) or 0)
+                merged["_outputTokens"] = str(getattr(response.usage_metadata, "candidates_token_count", 0) or 0)
+                merged["_totalTokens"] = str(getattr(response.usage_metadata, "total_token_count", 0) or 0)
 
             return merged
 
-        raise ValueError("Model returned an empty payload.")
+        raise ValueError(f"Empty payload from Vision AI. Diagnostic details: {last_error_msg}")
 
     except Exception as e:
         res = DEFAULT_DWC_RECORD.copy()
