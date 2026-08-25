@@ -74,6 +74,8 @@ if "work_dir" not in st.session_state:
     st.session_state.work_dir = tempfile.mkdtemp()
 if "out_dir" not in st.session_state:
     st.session_state.out_dir = tempfile.mkdtemp()
+if "form_ver" not in st.session_state:
+    st.session_state.form_ver = 0
 
 DEFAULT_DWC_RECORD = {
     "catalogNumber": "",
@@ -115,13 +117,6 @@ DEFAULT_DWC_RECORD = {
     "verbatimElevation": "",
     "verbatimLabel": "",
 }
-
-
-def sync_record_to_widgets(idx: int, record: dict):
-    """Synchronizes a Darwin Core dictionary directly into Streamlit's widget session keys."""
-    st.session_state.page_data[idx] = record.copy()
-    for key, val in record.items():
-        st.session_state[f"{key}_{idx}"] = str(val) if val is not None else ""
 
 
 # -----------------------------------------------------------------------------
@@ -358,7 +353,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         return res
 
 
-def render_map_georeference(specimen_data, record_key="specimen"):
+def render_map_georeference(specimen_data, record_key="specimen", ver=0):
     """Multi-tier georeferencer with isolated session rendering."""
     lat_val = str(specimen_data.get("decimalLatitude", "")).strip()
     lon_val = str(specimen_data.get("decimalLongitude", "")).strip()
@@ -423,7 +418,7 @@ def render_map_georeference(specimen_data, record_key="specimen"):
         ).add_to(m)
 
     map_response = st_folium(
-        m, height=280, use_container_width=True, key=f"map_{record_key}"
+        m, height=280, use_container_width=True, key=f"map_{record_key}_{ver}"
     )
 
     if map_response and map_response.get("last_clicked"):
@@ -437,21 +432,21 @@ def render_map_georeference(specimen_data, record_key="specimen"):
         in_lat = st.text_input(
             "Latitude",
             value=specimen_data.get("decimalLatitude", ""),
-            key=f"lat_in_{record_key}",
+            key=f"lat_in_{record_key}_{ver}",
         )
         specimen_data["decimalLatitude"] = in_lat.strip()
     with c2:
         in_lon = st.text_input(
             "Longitude",
             value=specimen_data.get("decimalLongitude", ""),
-            key=f"lon_in_{record_key}",
+            key=f"lon_in_{record_key}_{ver}",
         )
         specimen_data["decimalLongitude"] = in_lon.strip()
     with c3:
         in_unc = st.text_input(
             "Uncertainty (m)",
             value=str(int(uncertainty)),
-            key=f"unc_in_{record_key}",
+            key=f"unc_in_{record_key}_{ver}",
         )
         specimen_data["coordinateUncertaintyInMeters"] = in_unc.strip()
 
@@ -505,12 +500,16 @@ if st.session_state.image_paths:
                 with st.spinner(
                     f"🤖 Auto-parsing specimen {current_idx + 1} with Vision AI..."
                 ):
-                    parsed_res = run_gemini_parser(image, API_KEY)
-                    sync_record_to_widgets(current_idx, parsed_res)
+                    st.session_state.page_data[current_idx] = run_gemini_parser(
+                        image, API_KEY
+                    )
             else:
-                sync_record_to_widgets(current_idx, DEFAULT_DWC_RECORD.copy())
+                st.session_state.page_data[current_idx] = (
+                    DEFAULT_DWC_RECORD.copy()
+                )
 
         pf = st.session_state.page_data[current_idx]
+        ver = st.session_state.form_ver
 
         # Navigation Bar
         nav1, nav2, nav3, nav4 = st.columns([2, 1, 1, 1])
@@ -550,7 +549,7 @@ if st.session_state.image_paths:
                 image,
                 realtime_update=True,
                 box_color="#0000FF",
-                key=f"cropper_{current_idx}",
+                key=f"cropper_{current_idx}_{ver}",
                 return_type="box",
             )
 
@@ -585,7 +584,7 @@ if st.session_state.image_paths:
             cat_num = st.text_input(
                 "Catalog Number (Barcode)",
                 value=auto_code,
-                key=f"catalogNumber_{current_idx}",
+                key=f"cat_num_{current_idx}_{ver}",
             )
 
             if st.button("Read Barcode from Blue Crop Box"):
@@ -595,8 +594,9 @@ if st.session_state.image_paths:
                 if cropped_code:
                     cat_num = cropped_code
                     pf["catalogNumber"] = cat_num
-                    st.session_state[f"catalogNumber_{current_idx}"] = cat_num
+                    st.session_state.form_ver += 1
                     st.success(f"Detected Barcode: {cat_num}")
+                    st.rerun()
                 else:
                     st.error("No barcode detected in crop box. Enter manually.")
 
@@ -620,8 +620,10 @@ if st.session_state.image_paths:
                     )
                 else:
                     with st.spinner("Analyzing sheet with Vision AI..."):
-                        parsed_res = run_gemini_parser(image, API_KEY)
-                        sync_record_to_widgets(current_idx, parsed_res)
+                        st.session_state.page_data[current_idx] = (
+                            run_gemini_parser(image, API_KEY)
+                        )
+                        st.session_state.form_ver += 1
                         st.rerun()
 
             tabs = st.tabs(
@@ -635,112 +637,166 @@ if st.session_state.image_paths:
 
             with tabs[0]:
                 sci_name = st.text_input(
-                    "scientificName", key=f"scientificName_{current_idx}"
+                    "scientificName",
+                    value=pf.get("scientificName", ""),
+                    key=f"sci_name_{current_idx}_{ver}",
                 )
                 tcol1, tcol2 = st.columns(2)
                 with tcol1:
-                    genus = st.text_input("genus", key=f"genus_{current_idx}")
+                    genus = st.text_input(
+                        "genus",
+                        value=pf.get("genus", ""),
+                        key=f"genus_{current_idx}_{ver}",
+                    )
                 with tcol2:
                     sp_ep = st.text_input(
-                        "specificEpithet", key=f"specificEpithet_{current_idx}"
+                        "specificEpithet",
+                        value=pf.get("specificEpithet", ""),
+                        key=f"sp_ep_{current_idx}_{ver}",
                     )
 
                 tcol3, tcol4 = st.columns(2)
                 with tcol3:
                     author = st.text_input(
                         "scientificNameAuthorship",
-                        key=f"scientificNameAuthorship_{current_idx}",
+                        value=pf.get("scientificNameAuthorship", ""),
+                        key=f"author_{current_idx}_{ver}",
                     )
                 with tcol4:
                     id_by = st.text_input(
-                        "identifiedBy", key=f"identifiedBy_{current_idx}"
+                        "identifiedBy",
+                        value=pf.get("identifiedBy", ""),
+                        key=f"id_by_{current_idx}_{ver}",
                     )
 
             with tabs[1]:
                 c1, c2 = st.columns(2)
                 with c1:
                     rec_by = st.text_input(
-                        "recordedBy", key=f"recordedBy_{current_idx}"
+                        "recordedBy",
+                        value=pf.get("recordedBy", ""),
+                        key=f"rec_by_{current_idx}_{ver}",
                     )
                     assoc_coll = st.text_input(
                         "associatedCollectors",
-                        key=f"associatedCollectors_{current_idx}",
+                        value=pf.get("associatedCollectors", ""),
+                        key=f"assoc_coll_{current_idx}_{ver}",
                     )
                 with c2:
                     rec_num = st.text_input(
-                        "recordNumber", key=f"recordNumber_{current_idx}"
+                        "recordNumber",
+                        value=pf.get("recordNumber", ""),
+                        key=f"rec_num_{current_idx}_{ver}",
                     )
 
                 d1, d2, d3, d4 = st.columns(4)
                 with d1:
                     ev_date = st.text_input(
-                        "eventDate", key=f"eventDate_{current_idx}"
+                        "eventDate",
+                        value=pf.get("eventDate", ""),
+                        key=f"ev_date_{current_idx}_{ver}",
                     )
                 with d2:
-                    yr = st.text_input("year", key=f"year_{current_idx}")
+                    yr = st.text_input(
+                        "year",
+                        value=pf.get("year", ""),
+                        key=f"yr_{current_idx}_{ver}",
+                    )
                 with d3:
-                    mo = st.text_input("month", key=f"month_{current_idx}")
+                    mo = st.text_input(
+                        "month",
+                        value=pf.get("month", ""),
+                        key=f"mo_{current_idx}_{ver}",
+                    )
                 with d4:
-                    dy = st.text_input("day", key=f"day_{current_idx}")
+                    dy = st.text_input(
+                        "day",
+                        value=pf.get("day", ""),
+                        key=f"dy_{current_idx}_{ver}",
+                    )
 
                 verb_date = st.text_input(
-                    "verbatimEventDate", key=f"verbatimEventDate_{current_idx}"
+                    "verbatimEventDate",
+                    value=pf.get("verbatimEventDate", ""),
+                    key=f"verb_date_{current_idx}_{ver}",
                 )
 
             with tabs[2]:
                 locality = st.text_area(
-                    "locality", key=f"locality_{current_idx}", height=70
+                    "locality",
+                    value=pf.get("locality", ""),
+                    key=f"locality_{current_idx}_{ver}",
+                    height=70,
                 )
                 loc_rem = st.text_input(
-                    "locationRemarks", key=f"locationRemarks_{current_idx}"
+                    "locationRemarks",
+                    value=pf.get("locationRemarks", ""),
+                    key=f"loc_rem_{current_idx}_{ver}",
                 )
 
                 g1, g2, g3, g4 = st.columns(4)
                 with g1:
                     cntry = st.text_input(
-                        "country", key=f"country_{current_idx}"
+                        "country",
+                        value=pf.get("country", "United States"),
+                        key=f"cntry_{current_idx}_{ver}",
                     )
                 with g2:
                     state_prov = st.text_input(
-                        "stateProvince", key=f"stateProvince_{current_idx}"
+                        "stateProvince",
+                        value=pf.get("stateProvince", ""),
+                        key=f"state_prov_{current_idx}_{ver}",
                     )
                 with g3:
                     county = st.text_input(
-                        "county", key=f"county_{current_idx}"
+                        "county",
+                        value=pf.get("county", ""),
+                        key=f"county_{current_idx}_{ver}",
                     )
                 with g4:
                     muni = st.text_input(
-                        "municipality", key=f"municipality_{current_idx}"
+                        "municipality",
+                        value=pf.get("municipality", ""),
+                        key=f"muni_{current_idx}_{ver}",
                     )
 
                 st.caption(
                     "📍 Interactive Georeferencing Map (Powered by GEOLocate & ArcGIS)"
                 )
-                render_map_georeference(pf, record_key=f"rec_{current_idx}")
+                render_map_georeference(
+                    pf, record_key=f"rec_{current_idx}", ver=ver
+                )
 
                 verb_coord = st.text_input(
                     "verbatimCoordinates",
-                    key=f"verbatimCoordinates_{current_idx}",
+                    value=pf.get("verbatimCoordinates", ""),
+                    key=f"verb_coord_{current_idx}_{ver}",
                 )
 
                 lcol1, lcol2, lcol3 = st.columns(3)
                 with lcol1:
                     elev_num = st.text_input(
-                        "elevationNumber", key=f"elevationNumber_{current_idx}"
+                        "elevationNumber",
+                        value=pf.get("elevationNumber", ""),
+                        key=f"elev_num_{current_idx}_{ver}",
                     )
                 with lcol2:
                     min_elev = st.text_input(
                         "minimumElevationInMeters",
-                        key=f"minimumElevationInMeters_{current_idx}",
+                        value=pf.get("minimumElevationInMeters", ""),
+                        key=f"min_elev_{current_idx}_{ver}",
                     )
                 with lcol3:
                     max_elev = st.text_input(
                         "maximumElevationInMeters",
-                        key=f"maximumElevationInMeters_{current_idx}",
+                        value=pf.get("maximumElevationInMeters", ""),
+                        key=f"max_elev_{current_idx}_{ver}",
                     )
 
                 verb_elev = st.text_input(
-                    "verbatimElevation", key=f"verbatimElevation_{current_idx}"
+                    "verbatimElevation",
+                    value=pf.get("verbatimElevation", ""),
+                    key=f"verb_elev_{current_idx}_{ver}",
                 )
 
             with tabs[3]:
@@ -769,29 +825,37 @@ if st.session_state.image_paths:
                     "reproductiveCondition",
                     options=symbiota_pheno_terms,
                     index=pheno_idx,
-                    key=f"reproductiveCondition_{current_idx}",
+                    key=f"rep_cond_{current_idx}_{ver}",
                 )
 
                 rcol1, rcol2 = st.columns(2)
                 with rcol1:
                     habitat = st.text_input(
-                        "habitat", key=f"habitat_{current_idx}"
+                        "habitat",
+                        value=pf.get("habitat", ""),
+                        key=f"habitat_{current_idx}_{ver}",
                     )
                     assoc_taxa = st.text_input(
-                        "associatedTaxa", key=f"associatedTaxa_{current_idx}"
+                        "associatedTaxa",
+                        value=pf.get("associatedTaxa", ""),
+                        key=f"assoc_taxa_{current_idx}_{ver}",
                     )
                 with rcol2:
                     substrate = st.text_input(
-                        "substrate", key=f"substrate_{current_idx}"
+                        "substrate",
+                        value=pf.get("substrate", ""),
+                        key=f"substrate_{current_idx}_{ver}",
                     )
                     occ_rem = st.text_input(
                         "occurrenceRemarks",
-                        key=f"occurrenceRemarks_{current_idx}",
+                        value=pf.get("occurrenceRemarks", ""),
+                        key=f"occ_rem_{current_idx}_{ver}",
                     )
 
                 verb_label = st.text_area(
                     "verbatimLabel",
-                    key=f"verbatimLabel_{current_idx}",
+                    value=pf.get("verbatimLabel", ""),
+                    key=f"verb_label_{current_idx}_{ver}",
                     height=90,
                 )
 
@@ -811,7 +875,6 @@ if st.session_state.image_paths:
 
                     shutil.copy(img_path, dest_path)
 
-                    # Export record explicitly excludes token metadata (_inputTokens, etc.)
                     rec_data = {
                         "institutionCode": inst_code,
                         "collectionCode": coll_code,
