@@ -311,7 +311,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         return res
 
     try:
-        # 1. Convert image (handles RGBA, PNG, TIFF) to standard JPEG bytes
+        # Convert image to standard JPEG bytes
         img_converted = img.convert("RGB")
         buf = io.BytesIO()
         img_converted.save(buf, format="JPEG", quality=90)
@@ -330,16 +330,31 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "Extract the primary label data, scientific name, collector, dates, location, and barcode numbers."
         )
 
-        # 2. Query stable gemini-2.0-flash model directly
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[prompt, image_part],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=HerbariumSchema,
-                temperature=0.1,
-            ),
-        )
+        # Supported flash models in order of preference
+        candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash"]
+        
+        response = None
+        last_error = None
+        
+        for model_name in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, image_part],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=HerbariumSchema,
+                        temperature=0.1,
+                    ),
+                )
+                if response:
+                    break
+            except Exception as err:
+                last_error = err
+                continue
+
+        if not response:
+            raise last_error or ValueError("All model attempts failed.")
 
         parsed_data = None
         if hasattr(response, "parsed") and response.parsed:
@@ -369,6 +384,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         res["verbatimLabel"] = f"API Error: {str(e)}"
         st.error(f"⚠️ Gemini API Execution Failed: {str(e)}")
         return res
+        
 def render_map_georeference(specimen_data, record_key="specimen"):
     lat_val = str(specimen_data.get("decimalLatitude", "")).strip()
     lon_val = str(specimen_data.get("decimalLongitude", "")).strip()
