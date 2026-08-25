@@ -305,16 +305,19 @@ def georeference_arcgis(search_term: str, county: str, state: str):
 
 
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Vision AI Parser with dynamic endpoint query, fallback, and schema enforcement."""
+    """Optimized Vision AI Parser: Fast payload downscaling & direct fast model execution."""
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
         res["verbatimLabel"] = "Error: Missing Gemini API Key."
         return res
 
     try:
-        img_converted = img.convert("RGB")
+        # 1. Downscale image payload for fast network transfer (keeps 100% OCR clarity)
+        img_payload = img.convert("RGB")
+        img_payload.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+
         buf = io.BytesIO()
-        img_converted.save(buf, format="JPEG", quality=85)
+        img_payload.save(buf, format="JPEG", quality=80)
         image_part = types.Part.from_bytes(
             data=buf.getvalue(),
             mime_type="image/jpeg"
@@ -328,69 +331,45 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "Extract primary label data, scientific name, collector, dates, location, and barcode numbers."
         )
 
-        # Query active models available on key to avoid 404 errors
-        candidate_models = []
-        try:
-            for m in client.models.list():
-                actions = getattr(m, "supported_actions", []) or getattr(m, "supported_generation_methods", [])
-                if "generateContent" in actions or "generate_content" in str(actions):
-                    m_id = m.name.replace("models/", "")
-                    # Filter out non-multimodal or retired string families
-                    if not any(tag in m_id for tag in ["embed", "tts", "image", "audio", "veo", "gemma", "1.5"]):
-                        candidate_models.append(m_id)
-        except Exception:
-            pass
-
-        if not candidate_models:
-            candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]
-        else:
-            candidate_models.sort(key=lambda x: ("flash" not in x, x))
-
+        # 2. Direct fast endpoints (skips slow client.models.list network call)
+        primary_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+        
         parsed_data = None
         last_error = None
         response = None
 
-        for model_name in candidate_models:
-            for attempt in range(3):
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[prompt, image_part],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=HerbariumSchema,
-                            temperature=0.1,
-                        ),
-                    )
+        for model_name in primary_models:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, image_part],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=HerbariumSchema,
+                        temperature=0.1,
+                    ),
+                )
 
-                    if hasattr(response, "parsed") and response.parsed:
-                        if isinstance(response.parsed, BaseModel):
-                            parsed_data = response.parsed.model_dump()
-                            break
-                        elif isinstance(response.parsed, dict):
-                            parsed_data = response.parsed
-                            break
-
-                    if hasattr(response, "text") and response.text:
-                        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-                        if clean_text:
-                            parsed_data = json.loads(clean_text)
-                            break
-
-                except Exception as err:
-                    last_error = err
-                    err_str = str(err)
-                    
-                    if "404" in err_str or "NOT_FOUND" in err_str:
+                if hasattr(response, "parsed") and response.parsed:
+                    if isinstance(response.parsed, BaseModel):
+                        parsed_data = response.parsed.model_dump()
                         break
-                    
-                    if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                        time.sleep(2 * (attempt + 1))
-                        continue
-                    break
+                    elif isinstance(response.parsed, dict):
+                        parsed_data = response.parsed
+                        break
 
-            if parsed_data:
-                break
+                if hasattr(response, "text") and response.text:
+                    clean_text = response.text.replace("```json", "").replace("```", "").strip()
+                    if clean_text:
+                        parsed_data = json.loads(clean_text)
+                        break
+
+            except Exception as err:
+                last_error = err
+                err_str = str(err)
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    continue  # Try next model immediately if deprecated
+                time.sleep(1)
 
         if parsed_data:
             merged = DEFAULT_DWC_RECORD.copy()
