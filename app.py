@@ -12,6 +12,7 @@ from google.genai import types
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
+from pydantic import BaseModel, Field
 from pyzbar.pyzbar import decode
 import requests
 import streamlit as st
@@ -20,10 +21,26 @@ from streamlit_folium import st_folium
 import zxingcpp
 
 # -----------------------------------------------------------------------------
-# 1. APP CONFIGURATION & SECURITY GATE
+# 1. APP CONFIGURATION, STICKY CSS & SECURITY GATE
 # -----------------------------------------------------------------------------
 st.set_page_config(
     layout="wide", page_title="Herbarium Image-First Digitization (WSCO)"
+)
+
+# Pin the left column (Specimen image & zoom previews) while the right form scrolls
+st.markdown(
+    """
+    <style>
+        [data-testid="stHorizontalBlock"] > div:first-child {
+            position: sticky;
+            top: 2rem;
+            align-self: flex-start;
+            max-height: 92vh;
+            overflow-y: auto;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 expected_password = st.secrets.get("APP_PASSWORD")
@@ -60,65 +77,114 @@ auto_parse = st.sidebar.checkbox(
 )
 
 # -----------------------------------------------------------------------------
-# 2. SESSION STATE & DEFAULT SCHEMA
+# 2. SESSION persistence & DISK AUTOSAVE ENGINE
 # -----------------------------------------------------------------------------
+AUTOSAVE_FILE = os.path.join(tempfile.gettempdir(), "wsco_herbarium_autosave.json")
+
+
+def save_autosave():
+    """Writes session state to a hidden disk cache to protect against browser refresh."""
+    try:
+        data = {
+            "records": st.session_state.get("records", []),
+            "idx": st.session_state.get("idx", 0),
+            "page_data": {
+                str(k): v
+                for k, v in st.session_state.get("page_data", {}).items()
+            },
+            "image_paths": st.session_state.get("image_paths", []),
+        }
+        with open(AUTOSAVE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def clear_autosave():
+    if os.path.exists(AUTOSAVE_FILE):
+        try:
+            os.remove(AUTOSAVE_FILE)
+        except Exception:
+            pass
+
+
 if "records" not in st.session_state:
-    st.session_state.records = []
-if "idx" not in st.session_state:
-    st.session_state.idx = 0
-if "page_data" not in st.session_state:
-    st.session_state.page_data = {}
-if "image_paths" not in st.session_state:
-    st.session_state.image_paths = []
+    if os.path.exists(AUTOSAVE_FILE):
+        try:
+            with open(AUTOSAVE_FILE, "r") as f:
+                saved = json.load(f)
+            st.session_state.records = saved.get("records", [])
+            st.session_state.idx = saved.get("idx", 0)
+            st.session_state.page_data = {
+                int(k): v for k, v in saved.get("page_data", {}).items()
+            }
+            st.session_state.image_paths = saved.get("image_paths", [])
+        except Exception:
+            st.session_state.records = []
+            st.session_state.idx = 0
+            st.session_state.page_data = {}
+            st.session_state.image_paths = []
+    else:
+        st.session_state.records = []
+        st.session_state.idx = 0
+        st.session_state.page_data = {}
+        st.session_state.image_paths = []
+
 if "work_dir" not in st.session_state:
     st.session_state.work_dir = tempfile.mkdtemp()
 if "out_dir" not in st.session_state:
     st.session_state.out_dir = tempfile.mkdtemp()
 
-DEFAULT_DWC_RECORD = {
-    "catalogNumber": "",
-    "barcodeBox": [],
-    "labelBox": [],
-    "scientificName": "",
-    "genus": "",
-    "specificEpithet": "",
-    "scientificNameAuthorship": "",
-    "identifiedBy": "",
-    "recordedBy": "",
-    "associatedCollectors": "",
-    "recordNumber": "",
-    "eventDate": "",
-    "verbatimEventDate": "",
-    "year": "",
-    "month": "",
-    "day": "",
-    "occurrenceRemarks": "",
-    "habitat": "",
-    "substrate": "",
-    "associatedTaxa": "",
-    "reproductiveCondition": "",
-    "country": "United States",
-    "stateProvince": "Utah",
-    "county": "",
-    "municipality": "",
-    "locality": "",
-    "geocodingSearchTerm": "",
-    "locationRemarks": "",
-    "decimalLatitude": "",
-    "decimalLongitude": "",
-    "coordinateUncertaintyInMeters": "1000",
-    "verbatimCoordinates": "",
-    "geodeticDatum": "WGS84",
-    "elevationNumber": "",
-    "minimumElevationInMeters": "",
-    "maximumElevationInMeters": "",
-    "verbatimElevation": "",
-    "verbatimLabel": "",
-}
+
+# -----------------------------------------------------------------------------
+# 3. PYDANTIC SCHEMA & DEFAULT RECORD
+# -----------------------------------------------------------------------------
+class HerbariumSchema(BaseModel):
+    catalogNumber: str = Field(default="", description="Extracted barcode or catalog ID number")
+    barcodeBox: list[int] = Field(default_factory=list, description="[ymin, xmin, ymax, xmax] scaled 0-1000")
+    labelBox: list[int] = Field(default_factory=list, description="[ymin, xmin, ymax, xmax] scaled 0-1000")
+    scientificName: str = Field(default="", description="Full taxon name including author if present")
+    genus: str = Field(default="", description="Genus name")
+    specificEpithet: str = Field(default="", description="Species epithet")
+    scientificNameAuthorship: str = Field(default="", description="Author name string")
+    identifiedBy: str = Field(default="", description="Determiner name")
+    recordedBy: str = Field(default="", description="Collector name(s)")
+    associatedCollectors: str = Field(default="", description="Co-collectors list")
+    recordNumber: str = Field(default="", description="Collector field number")
+    eventDate: str = Field(default="", description="Collection date in YYYY-MM-DD format if possible")
+    verbatimEventDate: str = Field(default="", description="Raw date string as written")
+    year: str = Field(default="", description="4-digit year")
+    month: str = Field(default="", description="Numeric month (1-12)")
+    day: str = Field(default="", description="Numeric day (1-31)")
+    occurrenceRemarks: str = Field(default="", description="Plant description or specimen observations")
+    habitat: str = Field(default="", description="Habitat or community notes")
+    substrate: str = Field(default="", description="Soil or growing medium notes")
+    associatedTaxa: str = Field(default="", description="Associated species list")
+    reproductiveCondition: str = Field(default="", description="Exact match from phenology terms or empty string")
+    country: str = Field(default="United States", description="Country name, EXACTLY 'United States' if US")
+    stateProvince: str = Field(default="", description="State or Province")
+    county: str = Field(default="", description="County or Parish")
+    municipality: str = Field(default="", description="City, town, or municipality")
+    locality: str = Field(default="", description="Detailed locality description")
+    geocodingSearchTerm: str = Field(default="", description="Simplified landmark name for geocoding")
+    locationRemarks: str = Field(default="", description="Additional location notes")
+    decimalLatitude: str = Field(default="", description="Numeric latitude in decimal degrees or empty string")
+    decimalLongitude: str = Field(default="", description="Numeric longitude in decimal degrees or empty string")
+    verbatimCoordinates: str = Field(default="", description="Raw coordinate string from label")
+    elevationNumber: str = Field(default="", description="Single elevation value in meters or empty string if range")
+    minimumElevationInMeters: str = Field(default="", description="Lower elevation in meters if range, else empty string")
+    maximumElevationInMeters: str = Field(default="", description="Upper elevation in meters if range, else empty string")
+    verbatimElevation: str = Field(default="", description="Raw elevation string as recorded on label")
+    verbatimLabel: str = Field(default="", description="Full exact verbatim label text")
+
+
+DEFAULT_DWC_RECORD = HerbariumSchema().model_dump()
+DEFAULT_DWC_RECORD["coordinateUncertaintyInMeters"] = "1000"
+DEFAULT_DWC_RECORD["geodeticDatum"] = "WGS84"
 
 
 # -----------------------------------------------------------------------------
-# 3. HELPER FUNCTIONS & ADVANCED GEOCODING ENGINES
+# 4. HELPER FUNCTIONS & ADVANCED GEOCODING ENGINES
 # -----------------------------------------------------------------------------
 def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
     if not box or len(box) != 4:
@@ -247,59 +313,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         prompt = """
         Examine this herbarium specimen sheet. Locate the primary specimen label, plant specimen, and barcode sticker.
-        Extract data into standard Symbiota / Darwin Core fields.
-
-        STRICT STANDARDIZATION RULES:
-        1. COUNTRY: If the specimen is from the US, set "country" to EXACTLY "United States".
-        2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" and "specificEpithet".
-        3. DATES: Extract "eventDate" (e.g. 1984-06-15). Break out "year", "month", and "day". Extract "verbatimEventDate" as written.
-        4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS/UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
-           IMPORTANT: If no numerical coordinates are printed on the label, leave BOTH "decimalLatitude" AND "decimalLongitude" as empty strings ("").
-        5. ELEVATION: Convert numeric values to meters. 
-           - If a single elevation value is present (not a range), populate "elevationNumber" with that single value, and leave BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" as empty strings ("").
-           - If an elevation range is present (e.g., 2000-2500 m), leave "elevationNumber" as an empty string (""), set "minimumElevationInMeters" to the lower value, and "maximumElevationInMeters" to the upper value.
-        6. PHENOLOGY: Assign "reproductiveCondition" to EXACTLY one of: ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"] or empty string.
-        7. GEOCODING SEARCH TERM: Extract a clean, simple landmark or named place for geocoding (e.g. "Lee Valley Reservoir" or "Greer"). Omit distances/directions.
-
-        Return ONLY a JSON object:
-        {
-            "catalogNumber": "Extracted barcode or catalog ID number",
-            "barcodeBox": [ymin, xmin, ymax, xmax],
-            "labelBox": [ymin, xmin, ymax, xmax],
-            "scientificName": "Full taxon name including author if present",
-            "genus": "Genus name",
-            "specificEpithet": "Species epithet",
-            "scientificNameAuthorship": "Author name string",
-            "identifiedBy": "Determiner name",
-            "recordedBy": "Collector name(s)",
-            "associatedCollectors": "Co-collectors list",
-            "recordNumber": "Collector field number",
-            "eventDate": "Collection date in YYYY-MM-DD format if possible",
-            "verbatimEventDate": "Raw date string as written",
-            "year": "4-digit year",
-            "month": "Numeric month (1-12)",
-            "day": "Numeric day (1-31)",
-            "occurrenceRemarks": "Plant description or specimen observations",
-            "habitat": "Habitat or community notes",
-            "substrate": "Soil or growing medium notes",
-            "associatedTaxa": "Associated species list",
-            "reproductiveCondition": "Exact match from phenology terms or empty string",
-            "country": "Country name",
-            "stateProvince": "State or Province",
-            "county": "County or Parish",
-            "municipality": "City, town, or municipality",
-            "locality": "Detailed locality description",
-            "geocodingSearchTerm": "Simplified landmark name for geocoding",
-            "locationRemarks": "Additional location notes",
-            "decimalLatitude": "Numeric latitude in decimal degrees or empty string",
-            "decimalLongitude": "Numeric longitude in decimal degrees or empty string",
-            "verbatimCoordinates": "Raw coordinate string from label",
-            "elevationNumber": "Single elevation value in meters or empty string if range",
-            "minimumElevationInMeters": "Lower elevation in meters if range, else empty string",
-            "maximumElevationInMeters": "Upper elevation in meters if range, else empty string",
-            "verbatimElevation": "Raw elevation string as recorded on label",
-            "verbatimLabel": "Full exact verbatim label text"
-        }
+        Extract data into standard Symbiota / Darwin Core fields matching the structured output schema.
         """
 
         last_error = None
@@ -309,7 +323,8 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                     model=model_name,
                     contents=[prompt, img],
                     config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
+                        response_mime_type="application/json",
+                        response_schema=HerbariumSchema,
                     ),
                 )
                 if response and response.text:
@@ -444,7 +459,7 @@ def render_map_georeference(specimen_data, record_key="specimen"):
 
 
 # -----------------------------------------------------------------------------
-# 4. BATCH UPLOAD MANAGEMENT
+# 5. BATCH UPLOAD MANAGEMENT
 # -----------------------------------------------------------------------------
 st.sidebar.header("3. Upload Batch")
 uploaded_files = st.sidebar.file_uploader(
@@ -473,10 +488,11 @@ if uploaded_files and not st.session_state.image_paths:
         if f.lower().endswith(valid_exts)
     ]
     st.session_state.image_paths = sorted(paths)
+    save_autosave()
     st.rerun()
 
 # -----------------------------------------------------------------------------
-# 5. MAIN DIGITIZATION WORKSPACE
+# 6. MAIN DIGITIZATION WORKSPACE
 # -----------------------------------------------------------------------------
 if st.session_state.image_paths:
     total_imgs = len(st.session_state.image_paths)
@@ -499,6 +515,7 @@ if st.session_state.image_paths:
                 st.session_state.page_data[current_idx] = (
                     DEFAULT_DWC_RECORD.copy()
                 )
+            save_autosave()
 
         pf = st.session_state.page_data[current_idx]
 
@@ -511,10 +528,12 @@ if st.session_state.image_paths:
         with nav2:
             if st.button("⬅️ Previous") and current_idx > 0:
                 st.session_state.idx -= 1
+                save_autosave()
                 st.rerun()
         with nav3:
             if st.button("⏭️ Skip") and current_idx < total_imgs - 1:
                 st.session_state.idx += 1
+                save_autosave()
                 st.rerun()
         with nav4:
             if st.button("↩️ Undo Last") and st.session_state.records:
@@ -526,15 +545,17 @@ if st.session_state.image_paths:
                 if os.path.exists(last_f):
                     os.remove(last_f)
                 st.session_state.idx = max(0, st.session_state.idx - 1)
+                save_autosave()
                 st.rerun()
 
         st.divider()
 
         col_left, col_right = st.columns([1, 1])
 
+        # Left Column: Sticky Specimen Viewer & Cropper
         with col_left:
             st.caption(
-                "Full Specimen Sheet. Draw a blue crop box over barcode if manual detection is required."
+                "Full Specimen Sheet (Pinned). Draw a crop box over barcode if manual detection is required."
             )
             barcode_box = st_cropper(
                 image,
@@ -544,29 +565,29 @@ if st.session_state.image_paths:
                 return_type="box",
             )
 
-        with col_right:
             b_crop = crop_box_1000(image, pf.get("barcodeBox"))
             l_crop = crop_box_1000(image, pf.get("labelBox"))
 
             if b_crop or l_crop:
-                st.markdown("#### 🔎 AI Zoomed Detection Views")
+                st.markdown("#### 🔎 AI Zoomed Previews")
                 zcol1, zcol2 = st.columns(2)
                 with zcol1:
                     if b_crop:
                         st.image(
                             b_crop,
-                            caption="Detected Barcode Region",
+                            caption="Detected Barcode",
                             use_container_width=True,
                         )
                 with zcol2:
                     if l_crop:
                         st.image(
                             l_crop,
-                            caption="Detected Label Region",
+                            caption="Detected Label",
                             use_container_width=True,
                         )
-                st.divider()
 
+        # Right Column: Independently Scrollable Form
+        with col_right:
             st.markdown("#### 1. Barcode Identification")
             auto_code = decode_barcode_fullres(image)
             if not auto_code and pf.get("catalogNumber"):
@@ -581,6 +602,7 @@ if st.session_state.image_paths:
                 if cropped_code:
                     cat_num = cropped_code
                     pf["catalogNumber"] = cat_num
+                    save_autosave()
                     st.success(f"Detected Barcode: {cat_num}")
                 else:
                     st.error("No barcode detected in crop box. Enter manually.")
@@ -608,6 +630,7 @@ if st.session_state.image_paths:
                         st.session_state.page_data[current_idx] = (
                             run_gemini_parser(image, API_KEY)
                         )
+                        save_autosave()
                         st.rerun()
 
             tabs = st.tabs(
@@ -793,7 +816,6 @@ if st.session_state.image_paths:
 
                     shutil.copy(img_path, dest_path)
 
-                    # Export record explicitly excludes token metadata (_inputTokens, etc.)
                     rec_data = {
                         "institutionCode": inst_code,
                         "collectionCode": coll_code,
@@ -840,12 +862,13 @@ if st.session_state.image_paths:
                     st.session_state.records.append(rec_data)
                     st.session_state.page_data[current_idx] = rec_data.copy()
                     st.session_state.idx += 1
+                    save_autosave()
                     st.rerun()
     else:
         st.success("🎉 Batch processing complete!")
 
 # -----------------------------------------------------------------------------
-# 6. LIVE SPREADSHEET EDITOR & EXPORT SUITE
+# 7. LIVE SPREADSHEET EDITOR & EXPORT SUITE
 # -----------------------------------------------------------------------------
 st.divider()
 st.markdown("### 📊 Live Symbiota Import Spreadsheet")
@@ -859,6 +882,7 @@ if st.session_state.records:
         key="spreadsheet_editor",
     )
     st.session_state.records = edited_df.to_dict("records")
+    save_autosave()
 
     st.markdown("### 🖼️ Saved Specimen Viewer")
     rec_labels = [
@@ -892,7 +916,7 @@ if st.session_state.records:
 else:
     st.info("No saved records in current session.")
 
-# Sidebar Exports
+# Sidebar Exports & Cache Management
 st.sidebar.header("4. Export Session Data")
 if st.session_state.records:
     export_df = pd.DataFrame(st.session_state.records)
@@ -917,3 +941,11 @@ if st.session_state.records:
         file_name="renamed_specimens.zip",
         mime="application/zip",
     )
+
+if st.sidebar.button("🗑️ Reset Batch & Clear Autosave Cache"):
+    clear_autosave()
+    st.session_state.records = []
+    st.session_state.idx = 0
+    st.session_state.page_data = {}
+    st.session_state.image_paths = []
+    st.rerun()
