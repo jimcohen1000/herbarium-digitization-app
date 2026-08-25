@@ -311,73 +311,64 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         return res
 
     try:
+        # 1. Convert image (handles RGBA, PNG, TIFF) to standard JPEG bytes
+        img_converted = img.convert("RGB")
+        buf = io.BytesIO()
+        img_converted.save(buf, format="JPEG", quality=90)
+        img_bytes = buf.getvalue()
+
+        image_part = types.Part.from_bytes(
+            data=img_bytes,
+            mime_type="image/jpeg"
+        )
+
         client = genai.Client(api_key=key)
-        candidate_models = [
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-        ]
 
-        prompt = """
-        Examine this herbarium specimen sheet. Locate the primary specimen label, plant specimen, and barcode sticker.
-        Extract data into standard Symbiota / Darwin Core fields matching the structured output schema.
-        """
+        prompt = (
+            "You are an expert botanical taxonomist and herbarium digitizer. "
+            "Examine this specimen sheet and extract all visible text into the requested JSON schema. "
+            "Extract the primary label data, scientific name, collector, dates, location, and barcode numbers."
+        )
 
-        last_error = None
-        for model_name in candidate_models:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[prompt, img],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=HerbariumSchema,
-                    ),
-                )
+        # 2. Query stable gemini-2.0-flash model directly
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[prompt, image_part],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=HerbariumSchema,
+                temperature=0.1,
+            ),
+        )
 
-                parsed_data = None
-                if hasattr(response, "parsed") and response.parsed:
-                    if isinstance(response.parsed, BaseModel):
-                        parsed_data = response.parsed.model_dump()
-                    elif isinstance(response.parsed, dict):
-                        parsed_data = response.parsed
-                elif response and response.text:
-                    clean_text = (
-                        response.text.replace("```json", "")
-                        .replace("```", "")
-                        .strip()
-                    )
-                    parsed_data = json.loads(clean_text)
+        parsed_data = None
+        if hasattr(response, "parsed") and response.parsed:
+            if isinstance(response.parsed, BaseModel):
+                parsed_data = response.parsed.model_dump()
+            elif isinstance(response.parsed, dict):
+                parsed_data = response.parsed
+        elif response and response.text:
+            clean_text = response.text.replace("```json", "").replace("```", "").strip()
+            parsed_data = json.loads(clean_text)
 
-                if parsed_data:
-                    merged = DEFAULT_DWC_RECORD.copy()
-                    merged.update(parsed_data)
+        if parsed_data:
+            merged = DEFAULT_DWC_RECORD.copy()
+            merged.update(parsed_data)
 
-                    if hasattr(response, "usage_metadata") and response.usage_metadata:
-                        merged["_inputTokens"] = str(
-                            response.usage_metadata.prompt_token_count or 0
-                        )
-                        merged["_outputTokens"] = str(
-                            response.usage_metadata.candidates_token_count or 0
-                        )
-                        merged["_totalTokens"] = str(
-                            response.usage_metadata.total_token_count or 0
-                        )
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                merged["_inputTokens"] = str(response.usage_metadata.prompt_token_count or 0)
+                merged["_outputTokens"] = str(response.usage_metadata.candidates_token_count or 0)
+                merged["_totalTokens"] = str(response.usage_metadata.total_token_count or 0)
 
-                    return merged
-            except Exception as err:
-                last_error = err
-                continue
+            return merged
 
-        if last_error:
-            raise last_error
+        raise ValueError("Model returned an empty payload.")
 
     except Exception as e:
         res = DEFAULT_DWC_RECORD.copy()
         res["verbatimLabel"] = f"API Error: {str(e)}"
+        st.error(f"⚠️ Gemini API Execution Failed: {str(e)}")
         return res
-
-
 def render_map_georeference(specimen_data, record_key="specimen"):
     lat_val = str(specimen_data.get("decimalLatitude", "")).strip()
     lon_val = str(specimen_data.get("decimalLongitude", "")).strip()
