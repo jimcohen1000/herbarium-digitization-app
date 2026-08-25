@@ -305,14 +305,14 @@ def georeference_arcgis(search_term: str, county: str, state: str):
 
 
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Optimized Vision AI Parser: Fast payload downscaling & direct fast model execution."""
+    """Vision AI Parser updated for Gemini 3.6 Flash endpoints with payload optimization."""
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
         res["verbatimLabel"] = "Error: Missing Gemini API Key."
         return res
 
     try:
-        # 1. Downscale image payload for fast network transfer (keeps 100% OCR clarity)
+        # Downscale payload to max 1600px for sub-second network transfer
         img_payload = img.convert("RGB")
         img_payload.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
@@ -331,8 +331,8 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "Extract primary label data, scientific name, collector, dates, location, and barcode numbers."
         )
 
-        # 2. Direct fast endpoints (skips slow client.models.list network call)
-        primary_models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+        # Active production models
+        primary_models = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
         
         parsed_data = None
         last_error = None
@@ -368,7 +368,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                 last_error = err
                 err_str = str(err)
                 if "404" in err_str or "NOT_FOUND" in err_str:
-                    continue  # Try next model immediately if deprecated
+                    continue  # Fall through immediately to next supported model string
                 time.sleep(1)
 
         if parsed_data:
