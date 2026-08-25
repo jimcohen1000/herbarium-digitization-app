@@ -28,7 +28,6 @@ st.set_page_config(
     layout="wide", page_title="Herbarium Image-First Digitization (WSCO)"
 )
 
-# Pin left column (Specimen image viewer) while right form scrolls independently
 st.markdown(
     """
     <style>
@@ -306,7 +305,7 @@ def georeference_arcgis(search_term: str, county: str, state: str):
 
 
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Vision AI Parser with active model fallback, Pydantic Schema enforcement, and 404/503 retry logic."""
+    """Vision AI Parser with dynamic endpoint query, fallback, and schema enforcement."""
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
         res["verbatimLabel"] = "Error: Missing Gemini API Key."
@@ -329,19 +328,29 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
             "Extract primary label data, scientific name, collector, dates, location, and barcode numbers."
         )
 
-        # Updated list of active models across production releases
-        active_models = [
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-3.1-pro-preview",
-            "gemini-1.5-flash",
-        ]
-        
+        # Query active models available on key to avoid 404 errors
+        candidate_models = []
+        try:
+            for m in client.models.list():
+                actions = getattr(m, "supported_actions", []) or getattr(m, "supported_generation_methods", [])
+                if "generateContent" in actions or "generate_content" in str(actions):
+                    m_id = m.name.replace("models/", "")
+                    # Filter out non-multimodal or retired string families
+                    if not any(tag in m_id for tag in ["embed", "tts", "image", "audio", "veo", "gemma", "1.5"]):
+                        candidate_models.append(m_id)
+        except Exception:
+            pass
+
+        if not candidate_models:
+            candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]
+        else:
+            candidate_models.sort(key=lambda x: ("flash" not in x, x))
+
         parsed_data = None
         last_error = None
         response = None
 
-        for model_name in active_models:
+        for model_name in candidate_models:
             for attempt in range(3):
                 try:
                     response = client.models.generate_content(
@@ -372,11 +381,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                     last_error = err
                     err_str = str(err)
                     
-                    # Skip to next model immediately on 404 / NOT_FOUND deprecation
                     if "404" in err_str or "NOT_FOUND" in err_str:
                         break
                     
-                    # Exponential backoff for rate limits or temporary outage
                     if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
                         time.sleep(2 * (attempt + 1))
                         continue
@@ -567,7 +574,6 @@ if st.session_state.image_paths:
 
         pf = st.session_state.page_data[current_idx]
 
-        # Navigation Bar
         nav1, nav2, nav3, nav4 = st.columns([2, 1, 1, 1])
         with nav1:
             st.markdown(
@@ -600,7 +606,6 @@ if st.session_state.image_paths:
 
         col_left, col_right = st.columns([1, 1])
 
-        # Left Column: Sticky Specimen Viewer & Cropper
         with col_left:
             st.caption("Full Specimen Sheet (Pinned). Draw a crop box if manual barcode cropping is needed.")
             barcode_box = st_cropper(
@@ -632,7 +637,6 @@ if st.session_state.image_paths:
                             use_container_width=True,
                         )
 
-        # Right Column: Independently Scrollable Form
         with col_right:
             st.markdown("#### 1. Barcode Identification")
             auto_code = decode_barcode_fullres(image)
