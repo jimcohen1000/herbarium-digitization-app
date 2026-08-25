@@ -27,7 +27,7 @@ st.set_page_config(
     layout="wide", page_title="Herbarium Image-First Digitization (WSCO)"
 )
 
-# Pin the left column (Specimen image & zoom previews) while the right form scrolls
+# Sticky pin for the left column (Specimen image viewer & cropping panel)
 st.markdown(
     """
     <style>
@@ -62,7 +62,7 @@ st.sidebar.header("2. Vision AI Configuration")
 user_api_key = st.sidebar.text_input(
     "Gemini API Key (Optional)",
     type="password",
-    help="Default key is loaded from secrets if available. Clear and type to override.",
+    help="Default key is loaded from secrets if available.",
 )
 API_KEY = (
     user_api_key.strip()
@@ -77,13 +77,13 @@ auto_parse = st.sidebar.checkbox(
 )
 
 # -----------------------------------------------------------------------------
-# 2. SESSION persistence & DISK AUTOSAVE ENGINE
+# 2. SESSION PERSISTENCE & DISK AUTOSAVE ENGINE
 # -----------------------------------------------------------------------------
 AUTOSAVE_FILE = os.path.join(tempfile.gettempdir(), "wsco_herbarium_autosave.json")
 
 
 def save_autosave():
-    """Writes session state to a hidden disk cache to protect against browser refresh."""
+    """Protects active state from browser refreshes by mirroring data to disk cache."""
     try:
         data = {
             "records": st.session_state.get("records", []),
@@ -137,7 +137,7 @@ if "out_dir" not in st.session_state:
 
 
 # -----------------------------------------------------------------------------
-# 3. PYDANTIC SCHEMA & DEFAULT RECORD
+# 3. PYDANTIC STRUCTURED OUTPUT SCHEMA
 # -----------------------------------------------------------------------------
 class HerbariumSchema(BaseModel):
     catalogNumber: str = Field(default="", description="Extracted barcode or catalog ID number")
@@ -184,20 +184,28 @@ DEFAULT_DWC_RECORD["geodeticDatum"] = "WGS84"
 
 
 # -----------------------------------------------------------------------------
-# 4. HELPER FUNCTIONS & ADVANCED GEOCODING ENGINES
+# 4. HELPER FUNCTIONS & PARSING ENGINES
 # -----------------------------------------------------------------------------
-def crop_box_1000(img: Image.Image, box: list) -> Image.Image:
-    if not box or len(box) != 4:
+def crop_box_1000(img: Image.Image, box) -> Image.Image:
+    """Handles both Gemini [ymin, xmin, ymax, xmax] lists and st_cropper dicts."""
+    if not box:
         return None
     try:
         w, h = img.size
-        ymin, xmin, ymax, xmax = box
-        abs_left = max(0, int((xmin / 1000.0) * w))
-        abs_top = max(0, int((ymin / 1000.0) * h))
-        abs_right = min(w, int((xmax / 1000.0) * w))
-        abs_bottom = min(h, int((ymax / 1000.0) * h))
-        if abs_right > abs_left and abs_bottom > abs_top:
-            return img.crop((abs_left, abs_top, abs_right, abs_bottom))
+        if isinstance(box, dict) and "left" in box:
+            left = int(box["left"])
+            top = int(box["top"])
+            right = int(box["left"] + box["width"])
+            bottom = int(box["top"] + box["height"])
+            return img.crop((left, top, right, bottom))
+        elif isinstance(box, list) and len(box) == 4:
+            ymin, xmin, ymax, xmax = box
+            abs_left = max(0, int((xmin / 1000.0) * w))
+            abs_top = max(0, int((ymin / 1000.0) * h))
+            abs_right = min(w, int((xmax / 1000.0) * w))
+            abs_bottom = min(h, int((ymax / 1000.0) * h))
+            if abs_right > abs_left and abs_bottom > abs_top:
+                return img.crop((abs_left, abs_top, abs_right, abs_bottom))
     except Exception:
         pass
     return None
@@ -241,12 +249,9 @@ def decode_barcode_fullres(img: Image.Image, crop_box: dict = None) -> str:
 
 
 def georeference_geolocate(locality: str, state: str, county: str):
-    """Queries GEOLocate Web API for offset calculations."""
     if not locality:
         return None
-    url = (
-        "https://www.geo-locate.org/webservices/geolocatesvcs/glws.asmx/Georef2"
-    )
+    url = "https://www.geo-locate.org/webservices/geolocatesvcs/glws.asmx/Georef2"
     clean_county = (
         county.replace(" County", "").replace(" Co.", "").strip()
         if county
@@ -263,11 +268,7 @@ def georeference_geolocate(locality: str, state: str, county: str):
         resp = requests.get(url, params=params, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
-            points = (
-                data.get("engine", {})
-                .get("result", {})
-                .get("resultSet", [])
-            )
+            points = data.get("engine", {}).get("result", {}).get("resultSet", [])
             if points:
                 top = points[0]
                 lat = str(round(float(top["WGS84Latitude"]), 6))
@@ -280,14 +281,11 @@ def georeference_geolocate(locality: str, state: str, county: str):
 
 
 def georeference_arcgis(search_term: str, county: str, state: str):
-    """Queries ArcGIS Geocoder for landmarks, features, and roads."""
     if not search_term and not county:
         return None
     try:
         geolocator = ArcGIS(user_agent="weber_state_herbarium_digitizer")
-        query_parts = [
-            p for p in [search_term, county, state, "United States"] if p
-        ]
+        query_parts = [p for p in [search_term, county, state, "United States"] if p]
         query = ", ".join(query_parts)
         loc = geolocator.geocode(query, timeout=5)
         if loc:
@@ -307,8 +305,8 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         client = genai.Client(api_key=key)
         candidate_models = [
             "gemini-2.5-flash",
-            "gemini-3.7-flash",
-            "gemini-3.6-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
         ]
 
         prompt = """
@@ -327,23 +325,38 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                         response_schema=HerbariumSchema,
                     ),
                 )
-                if response and response.text:
-                    parsed = json.loads(response.text)
+
+                parsed_data = None
+                # Check for SDK parsed object
+                if hasattr(response, "parsed") and response.parsed:
+                    if isinstance(response.parsed, BaseModel):
+                        parsed_data = response.parsed.model_dump()
+                    elif isinstance(response.parsed, dict):
+                        parsed_data = response.parsed
+                elif response and response.text:
+                    clean_text = (
+                        response.text.replace("```json", "")
+                        .replace("```", "")
+                        .strip()
+                    )
+                    parsed_data = json.loads(clean_text)
+
+                if parsed_data:
                     merged = DEFAULT_DWC_RECORD.copy()
-                    merged.update(parsed)
+                    merged.update(parsed_data)
 
                     if (
                         hasattr(response, "usage_metadata")
                         and response.usage_metadata
                     ):
                         merged["_inputTokens"] = str(
-                            response.usage_metadata.prompt_token_count
+                            response.usage_metadata.prompt_token_count or 0
                         )
                         merged["_outputTokens"] = str(
-                            response.usage_metadata.candidates_token_count
+                            response.usage_metadata.candidates_token_count or 0
                         )
                         merged["_totalTokens"] = str(
-                            response.usage_metadata.total_token_count
+                            response.usage_metadata.total_token_count or 0
                         )
 
                     return merged
@@ -361,7 +374,6 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
 
 def render_map_georeference(specimen_data, record_key="specimen"):
-    """Multi-tier georeferencer with isolated session rendering."""
     lat_val = str(specimen_data.get("decimalLatitude", "")).strip()
     lon_val = str(specimen_data.get("decimalLongitude", "")).strip()
 
@@ -377,9 +389,7 @@ def render_map_georeference(specimen_data, record_key="specimen"):
             specimen_data["decimalLongitude"] = gl_res[1]
             specimen_data["coordinateUncertaintyInMeters"] = gl_res[2]
         else:
-            ag_res = georeference_arcgis(
-                search_term or locality, county, state
-            )
+            ag_res = georeference_arcgis(search_term or locality, county, state)
             if ag_res:
                 specimen_data["decimalLatitude"] = ag_res[0]
                 specimen_data["decimalLongitude"] = ag_res[1]
@@ -554,9 +564,7 @@ if st.session_state.image_paths:
 
         # Left Column: Sticky Specimen Viewer & Cropper
         with col_left:
-            st.caption(
-                "Full Specimen Sheet (Pinned). Draw a crop box over barcode if manual detection is required."
-            )
+            st.caption("Full Specimen Sheet (Pinned). Draw a crop box if manual barcode cropping is needed.")
             barcode_box = st_cropper(
                 image,
                 realtime_update=True,
@@ -609,7 +617,6 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            # Token Metric Header & Vision Action
             st.markdown("#### 2. Vision AI Label Data")
 
             in_tok = pf.get("_inputTokens", "0")
@@ -720,9 +727,7 @@ if st.session_state.image_paths:
                         "municipality", value=pf.get("municipality", "")
                     )
 
-                st.caption(
-                    "📍 Interactive Georeferencing Map (Powered by GEOLocate & ArcGIS)"
-                )
+                st.caption("📍 Interactive Georeferencing Map (GEOLocate & ArcGIS)")
                 render_map_georeference(pf, record_key=f"rec_{current_idx}")
 
                 verb_coord = st.text_input(
@@ -804,9 +809,7 @@ if st.session_state.image_paths:
 
             if st.button("💾 Save Record & Next Specimen", type="primary"):
                 if not cat_num:
-                    st.error(
-                        "Catalog Number (Barcode) is required before saving."
-                    )
+                    st.error("Catalog Number (Barcode) is required before saving.")
                 else:
                     ext = os.path.splitext(img_path)[1]
                     new_filename = f"{cat_num}{ext}"
@@ -868,7 +871,7 @@ if st.session_state.image_paths:
         st.success("🎉 Batch processing complete!")
 
 # -----------------------------------------------------------------------------
-# 7. LIVE SPREADSHEET EDITOR & EXPORT SUITE
+# 7. SPREADSHEET EDITOR & EXPORTS
 # -----------------------------------------------------------------------------
 st.divider()
 st.markdown("### 📊 Live Symbiota Import Spreadsheet")
@@ -913,10 +916,7 @@ if st.session_state.records:
         with rcol2:
             st.markdown("**Saved Darwin Core Fields**")
             st.json(rec)
-else:
-    st.info("No saved records in current session.")
 
-# Sidebar Exports & Cache Management
 st.sidebar.header("4. Export Session Data")
 if st.session_state.records:
     export_df = pd.DataFrame(st.session_state.records)
