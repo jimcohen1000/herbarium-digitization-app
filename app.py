@@ -311,7 +311,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         return res
 
     try:
-        # 1. Convert image to RGB JPEG bytes (handles TIF, PNG, RGBA)
+        # Convert specimen image into standard JPEG bytes for API transfer
         img_converted = img.convert("RGB")
         buf = io.BytesIO()
         img_converted.save(buf, format="JPEG", quality=85)
@@ -326,17 +326,17 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         prompt = (
             "You are an expert botanical taxonomist and herbarium digitizer. "
-            "Examine this specimen sheet and extract all visible text into the requested schema. "
-            "Extract the primary label data, scientific name, collector, dates, location, and barcode numbers."
+            "Examine this specimen sheet and extract all visible text into the requested JSON schema. "
+            "Extract primary label data, scientific name, collector, dates, location, and barcode numbers."
         )
 
-        candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+        # Active, supported production model endpoints
+        active_models = ["gemini-2.5-flash", "gemini-flash-latest"]
         
         parsed_data = None
-        last_error_msg = ""
+        last_error = None
 
-        # Tier 1: Try structured output with Pydantic schema enforcement
-        for model_name in candidate_models:
+        for model_name in active_models:
             try:
                 response = client.models.generate_content(
                     model=model_name,
@@ -344,11 +344,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=HerbariumSchema,
-                        temperature=0.1,
                     ),
                 )
 
-                # Check Pydantic parsed output
                 if hasattr(response, "parsed") and response.parsed:
                     if isinstance(response.parsed, BaseModel):
                         parsed_data = response.parsed.model_dump()
@@ -357,48 +355,15 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                         parsed_data = response.parsed
                         break
 
-                # Fallback to response text
                 if hasattr(response, "text") and response.text:
                     clean_text = response.text.replace("```json", "").replace("```", "").strip()
                     if clean_text:
                         parsed_data = json.loads(clean_text)
                         break
 
-                # Record diagnostic info if no content returned
-                if hasattr(response, "candidates") and response.candidates:
-                    finish_reason = response.candidates[0].finish_reason
-                    last_error_msg = f"{model_name} stopped with finish_reason: {finish_reason}"
-                else:
-                    last_error_msg = f"{model_name} returned no candidates."
-
             except Exception as err:
-                last_error_msg = str(err)
+                last_error = err
                 continue
-
-        # Tier 2: Fallback to unconstrained JSON mode if Pydantic validation rejected the response
-        if not parsed_data:
-            for model_name in candidate_models:
-                try:
-                    json_prompt = (
-                        f"{prompt}\n\nReturn a valid JSON object matching standard Darwin Core fields: "
-                        "catalogNumber, scientificName, genus, specificEpithet, recordedBy, eventDate, locality, country, stateProvince, county, verbatimLabel."
-                    )
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[json_prompt, image_part],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.1,
-                        ),
-                    )
-                    if hasattr(response, "text") and response.text:
-                        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-                        if clean_text:
-                            parsed_data = json.loads(clean_text)
-                            break
-                except Exception as err:
-                    last_error_msg = str(err)
-                    continue
 
         if parsed_data:
             merged = DEFAULT_DWC_RECORD.copy()
@@ -411,7 +376,7 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
             return merged
 
-        raise ValueError(f"Empty payload from Vision AI. Diagnostic details: {last_error_msg}")
+        raise ValueError(f"Failed to process image. Model error: {last_error}")
 
     except Exception as e:
         res = DEFAULT_DWC_RECORD.copy()
