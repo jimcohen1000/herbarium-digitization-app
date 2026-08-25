@@ -304,90 +304,95 @@ def georeference_arcgis(search_term: str, county: str, state: str):
     return None
 
 
+# Vision API Label Parser
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
-    """Vision AI Parser updated for Gemini 3.6 Flash endpoints with payload optimization."""
-    if not key:
-        res = DEFAULT_DWC_RECORD.copy()
-        res["verbatimLabel"] = "Error: Missing Gemini API Key."
-        return res
-
+    """Uses Google GenAI SDK to parse Darwin Core / Symbiota fields."""
     try:
-        # Downscale payload to max 1600px for sub-second network transfer
-        img_payload = img.convert("RGB")
-        img_payload.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-
-        buf = io.BytesIO()
-        img_payload.save(buf, format="JPEG", quality=80)
-        image_part = types.Part.from_bytes(
-            data=buf.getvalue(),
-            mime_type="image/jpeg"
-        )
-
         client = genai.Client(api_key=key)
 
-        prompt = (
-            "You are an expert botanical taxonomist and herbarium digitizer. "
-            "Examine this specimen sheet and extract all visible text into the requested JSON schema. "
-            "Extract primary label data, scientific name, collector, dates, location, and barcode numbers."
-        )
+        # Fast network optimization: resize large scan before sending
+        img_payload = img.copy()
+        img_payload.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
-        # Active production models
-        primary_models = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
-        
-        parsed_data = None
+        candidate_models = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-2.5-flash",
+        ]
+
+        prompt = """
+        Examine this herbarium specimen sheet. Locate the primary specimen label, plant specimen, and barcode sticker.
+        Extract data into standard Symbiota / Darwin Core fields.
+
+        STRICT STANDARDIZATION RULES:
+        1. COUNTRY: If the specimen is from the US, set "country" to EXACTLY "United States" (do NOT use "US", "USA", or "United States of America").
+        2. TAXONOMY: Extract "scientificName" (e.g. Pinus ponderosa Douglas ex C.Lawson). Break out "genus" (e.g. Pinus) and "specificEpithet" (e.g. ponderosa).
+        3. DATES: Extract "eventDate" (e.g. 1984-06-15). Also break out integer values for "year", "month", and "day" separately.
+        4. COORDINATES: Extract "verbatimCoordinates" as printed. Convert any DMS or UTM into decimal degrees as "decimalLatitude" and "decimalLongitude". Ensure West and South values are negative numbers.
+        5. ELEVATION: Extract "verbatimElevation" as printed. Convert numeric values to meters.
+           - If a single value is given (e.g., 1500 m or 5000 ft), set BOTH "minimumElevationInMeters" AND "maximumElevationInMeters" to that converted value in meters.
+           - If a range is given (e.g., 1500-1800 m), set min and max accordingly.
+        6. PHENOLOGY: Inspect the plant material for flowers, fruits, or cones. Assign "reproductiveCondition" to EXACTLY one of:
+           ["In Flower", "In Fruit", "Flowering and Fruiting", "Flower Buds", "Vegetative", "Sterile", "Cones", "Spores"].
+           - If unclear, unidentifiable, or ambiguous, leave as empty string ("").
+
+        Return ONLY a JSON object matching this schema:
+        {
+            "catalogNumber": "Extracted barcode or catalog ID number",
+            "barcodeBox": [ymin, xmin, ymax, xmax],
+            "labelBox": [ymin, xmin, ymax, xmax],
+            "scientificName": "Full taxon name including author if present",
+            "genus": "Genus name",
+            "specificEpithet": "Species epithet",
+            "recordedBy": "Collector name(s)",
+            "recordNumber": "Collector number",
+            "eventDate": "Collection date in YYYY-MM-DD or verbatim format",
+            "year": "4-digit year",
+            "month": "Numeric month (1-12) or 2-digit month string",
+            "day": "Numeric day (1-31) or 2-digit day string",
+            "occurrenceRemarks": "Plant description or specimen observations",
+            "habitat": "Habitat or community notes",
+            "substrate": "Soil, rock type, or growing medium notes",
+            "associatedTaxa": "Associated species list",
+            "reproductiveCondition": "Exact match from phenology terms or empty string",
+            "country": "Country name (must be 'United States' for US specimens)",
+            "stateProvince": "State or Province",
+            "county": "County or Parish",
+            "municipality": "City, town, or municipality",
+            "locality": "Detailed locality description",
+            "locationRemarks": "Additional location or access notes",
+            "decimalLatitude": "Numeric latitude in decimal degrees",
+            "decimalLongitude": "Numeric longitude in decimal degrees",
+            "verbatimCoordinates": "Raw coordinate string from label",
+            "minimumElevationInMeters": "Min elevation in meters (set equal to max if single value)",
+            "maximumElevationInMeters": "Max elevation in meters (set equal to min if single value)",
+            "verbatimElevation": "Raw elevation string as recorded on label",
+            "verbatimLabel": "Full exact verbatim label text"
+        }
+        """
+
         last_error = None
-        response = None
-
-        for model_name in primary_models:
+        for model_name in candidate_models:
             try:
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=[prompt, image_part],
+                    contents=[prompt, img_payload],
                     config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=HerbariumSchema,
-                        temperature=0.1,
+                        response_mime_type="application/json"
                     ),
                 )
-
-                if hasattr(response, "parsed") and response.parsed:
-                    if isinstance(response.parsed, BaseModel):
-                        parsed_data = response.parsed.model_dump()
-                        break
-                    elif isinstance(response.parsed, dict):
-                        parsed_data = response.parsed
-                        break
-
-                if hasattr(response, "text") and response.text:
-                    clean_text = response.text.replace("```json", "").replace("```", "").strip()
-                    if clean_text:
-                        parsed_data = json.loads(clean_text)
-                        break
-
+                if response and response.text:
+                    return json.loads(response.text)
             except Exception as err:
                 last_error = err
-                err_str = str(err)
-                if "404" in err_str or "NOT_FOUND" in err_str:
-                    continue  # Fall through immediately to next supported model string
-                time.sleep(1)
+                continue
 
-        if parsed_data:
-            merged = DEFAULT_DWC_RECORD.copy()
-            merged.update(parsed_data)
-
-            if response and hasattr(response, "usage_metadata") and response.usage_metadata:
-                merged["_inputTokens"] = str(getattr(response.usage_metadata, "prompt_token_count", 0) or 0)
-                merged["_outputTokens"] = str(getattr(response.usage_metadata, "candidates_token_count", 0) or 0)
-                merged["_totalTokens"] = str(getattr(response.usage_metadata, "total_token_count", 0) or 0)
-
-            return merged
-
-        raise ValueError(f"All model attempts failed. Last error: {last_error}")
+        if last_error:
+            raise last_error
 
     except Exception as e:
-        res = DEFAULT_DWC_RECORD.copy()
+        res = default_fields.copy() if 'default_fields' in globals() else {}
         res["verbatimLabel"] = f"API Error: {str(e)}"
-        st.error(f"⚠️ Gemini API Execution Failed: {str(e)}")
         return res
 
 
