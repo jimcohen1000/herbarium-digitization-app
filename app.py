@@ -76,6 +76,8 @@ if "out_dir" not in st.session_state:
     st.session_state.out_dir = tempfile.mkdtemp()
 if "form_ver" not in st.session_state:
     st.session_state.form_ver = 0
+if "last_error" not in st.session_state:
+    st.session_state.last_error = None
 
 DEFAULT_DWC_RECORD = {
     "catalogNumber": "",
@@ -237,10 +239,10 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
         res["verbatimLabel"] = "Error: Missing Gemini API Key."
+        st.session_state.last_error = "Gemini API key is missing. Please enter a key in the sidebar or secrets."
         return res
 
     try:
-        # Downscale copy of image to speed up API transmission
         img_payload = img.copy()
         img_payload.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
@@ -337,19 +339,20 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                             response.usage_metadata.total_token_count
                         )
 
+                    st.session_state.last_error = None
                     return merged
             except Exception as err:
                 last_error = err
                 continue
 
         if last_error:
-            st.error(f"⚠️ API Call Failed: {str(last_error)}")
+            st.session_state.last_error = f"Gemini API Call Failed: {str(last_error)}"
             raise last_error
 
     except Exception as e:
         res = DEFAULT_DWC_RECORD.copy()
         res["verbatimLabel"] = f"API Error: {str(e)}"
-        st.error(f"⚠️ Gemini Execution Error: {str(e)}")
+        st.session_state.last_error = f"Gemini Execution Error: {str(e)}"
         return res
 
 
@@ -554,6 +557,16 @@ if st.session_state.image_paths:
             )
 
         with col_right:
+            # --- DEDICATED ERROR BANNER DISPLAY ---
+            if st.session_state.last_error:
+                err_col1, err_col2 = st.columns([5, 1])
+                with err_col1:
+                    st.error(f"⚠️ {st.session_state.last_error}")
+                with err_col2:
+                    if st.button("✖️ Dismiss", key="clear_err_btn"):
+                        st.session_state.last_error = None
+                        st.rerun()
+
             b_crop = crop_box_1000(image, pf.get("barcodeBox"))
             l_crop = crop_box_1000(image, pf.get("labelBox"))
 
@@ -594,11 +607,12 @@ if st.session_state.image_paths:
                 if cropped_code:
                     cat_num = cropped_code
                     pf["catalogNumber"] = cat_num
+                    st.session_state.last_error = None
                     st.session_state.form_ver += 1
-                    st.success(f"Detected Barcode: {cat_num}")
                     st.rerun()
                 else:
-                    st.error("No barcode detected in crop box. Enter manually.")
+                    st.session_state.last_error = "No barcode detected in the selected blue crop region. Try adjusting the bounding box."
+                    st.rerun()
 
             st.divider()
 
@@ -615,9 +629,8 @@ if st.session_state.image_paths:
 
             if st.button("🔄 Run / Re-Parse with Vision AI", type="primary"):
                 if not API_KEY:
-                    st.error(
-                        "Please enter a valid Gemini API Key in the sidebar or secrets."
-                    )
+                    st.session_state.last_error = "Please enter a valid Gemini API Key in the sidebar or secrets."
+                    st.rerun()
                 else:
                     with st.spinner("Analyzing sheet with Vision AI..."):
                         st.session_state.page_data[current_idx] = (
@@ -863,9 +876,8 @@ if st.session_state.image_paths:
 
             if st.button("💾 Save Record & Next Specimen", type="primary"):
                 if not cat_num:
-                    st.error(
-                        "Catalog Number (Barcode) is required before saving."
-                    )
+                    st.session_state.last_error = "Catalog Number (Barcode) is required before saving."
+                    st.rerun()
                 else:
                     ext = os.path.splitext(img_path)[1]
                     new_filename = f"{cat_num}{ext}"
@@ -918,6 +930,7 @@ if st.session_state.image_paths:
                         "associatedMedia": new_filename,
                     }
 
+                    st.session_state.last_error = None
                     st.session_state.records.append(rec_data)
                     st.session_state.page_data[current_idx] = rec_data.copy()
                     st.session_state.idx += 1
