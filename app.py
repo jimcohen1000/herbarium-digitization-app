@@ -3,7 +3,9 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import zipfile
+import gc
 import cv2
 import folium
 from geopy.geocoders import ArcGIS
@@ -235,20 +237,6 @@ def georeference_arcgis(search_term: str, county: str, state: str):
     return None
 
 
-import time
-import json
-from PIL import Image
-import streamlit as st
-from google import genai
-from google.genai import types
-
-import time
-import json
-from PIL import Image
-import streamlit as st
-from google import genai
-from google.genai import types
-
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
@@ -256,13 +244,13 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         st.session_state.last_error = "Gemini API key is missing. Please enter a key in the sidebar or secrets."
         return res
 
+    img_payload = None
     try:
         img_payload = img.copy()
         img_payload.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
         client = genai.Client(api_key=key)
         
-        # Updated active models (removing retired/deprecated model strings)
         candidate_models = [
             "gemini-3.6-flash",
             "gemini-3.7-flash",
@@ -353,12 +341,9 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                 except Exception as err:
                     last_error = err
                     err_str = str(err)
-                    
-                    # Retry transient 503/429 server backpressure errors
                     if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
                         time.sleep((2 ** attempt) + 0.5)
                         continue
-                    # Immediately skip deprecated 404 models without retrying
                     elif any(code in err_str for code in ["404", "NOT_FOUND"]):
                         break
                     else:
@@ -373,6 +358,15 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         res["verbatimLabel"] = f"API Error: {str(e)}"
         st.session_state.last_error = f"Gemini Execution Error: {str(e)}"
         return res
+
+    finally:
+        if img_payload is not None:
+            try:
+                img_payload.close()
+            except Exception:
+                pass
+            del img_payload
+        gc.collect()
 
 
 def render_map_georeference(specimen_data, record_key="specimen", ver=0):
@@ -576,7 +570,6 @@ if st.session_state.image_paths:
             )
 
         with col_right:
-            # --- DEDICATED ERROR BANNER DISPLAY ---
             if st.session_state.last_error:
                 err_col1, err_col2 = st.columns([5, 1])
                 with err_col1:
@@ -597,14 +590,14 @@ if st.session_state.image_paths:
                         st.image(
                             b_crop,
                             caption="Detected Barcode Region",
-                            use_container_width=True,
+                            width="stretch",
                         )
                 with zcol2:
                     if l_crop:
                         st.image(
                             l_crop,
                             caption="Detected Label Region",
-                            use_container_width=True,
+                            width="stretch",
                         )
                 st.divider()
 
@@ -635,7 +628,6 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            # Token Metric Header & Vision Action
             st.markdown("#### 2. Vision AI Label Data")
 
             in_tok = pf.get("_inputTokens", "0")
@@ -954,6 +946,8 @@ if st.session_state.image_paths:
                     st.session_state.page_data[current_idx] = rec_data.copy()
                     st.session_state.idx += 1
                     st.rerun()
+
+        image.close()
     else:
         st.success("🎉 Batch processing complete!")
 
@@ -995,7 +989,7 @@ if st.session_state.records:
                 st.image(
                     saved_img_path,
                     caption=f"Renamed Specimen File: {img_name}",
-                    use_container_width=True,
+                    width="stretch",
                 )
             else:
                 st.warning("Saved image file not found.")
@@ -1030,3 +1024,6 @@ if st.session_state.records:
         file_name="renamed_specimens.zip",
         mime="application/zip",
     )
+
+# Cleanup cycle
+gc.collect()
