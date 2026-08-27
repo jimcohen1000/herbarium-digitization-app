@@ -235,6 +235,13 @@ def georeference_arcgis(search_term: str, county: str, state: str):
     return None
 
 
+import time
+import json
+from PIL import Image
+import streamlit as st
+from google import genai
+from google.genai import types
+
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
@@ -247,10 +254,12 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
         img_payload.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
 
         client = genai.Client(api_key=key)
+        
+        # Priority model list (Main -> Fallbacks)
         candidate_models = [
-            "gemini-2.5-flash",
             "gemini-3.7-flash",
             "gemini-3.6-flash",
+            "gemini-2.5-flash",
         ]
 
         prompt = """
@@ -312,38 +321,39 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         last_error = None
         for model_name in candidate_models:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[prompt, img_payload],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    ),
-                )
-                if response and response.text:
-                    parsed = json.loads(response.text)
-                    merged = DEFAULT_DWC_RECORD.copy()
-                    merged.update(parsed)
+            # Try up to 3 retries per model with exponential backoff for transient 503/429 errors
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[prompt, img_payload],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json"
+                        ),
+                    )
+                    if response and response.text:
+                        parsed = json.loads(response.text)
+                        merged = DEFAULT_DWC_RECORD.copy()
+                        merged.update(parsed)
 
-                    if (
-                        hasattr(response, "usage_metadata")
-                        and response.usage_metadata
-                    ):
-                        merged["_inputTokens"] = str(
-                            response.usage_metadata.prompt_token_count
-                        )
-                        merged["_outputTokens"] = str(
-                            response.usage_metadata.candidates_token_count
-                        )
-                        merged["_totalTokens"] = str(
-                            response.usage_metadata.total_token_count
-                        )
+                        if hasattr(response, "usage_metadata") and response.usage_metadata:
+                            merged["_inputTokens"] = str(response.usage_metadata.prompt_token_count)
+                            merged["_outputTokens"] = str(response.usage_metadata.candidates_token_count)
+                            merged["_totalTokens"] = str(response.usage_metadata.total_token_count)
 
-                    st.session_state.last_error = None
-                    return merged
-            except Exception as err:
-                last_error = err
-                continue
+                        st.session_state.last_error = None
+                        return merged
+
+                except Exception as err:
+                    last_error = err
+                    err_str = str(err)
+                    # If server is unavailable (503) or rate-limited (429), pause and retry
+                    if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                        time.sleep((2 ** attempt) + 0.5)
+                        continue
+                    else:
+                        # Non-transient error (e.g., model deprecation or bad request), move to next model
+                        break
 
         if last_error:
             st.session_state.last_error = f"Gemini API Call Failed: {str(last_error)}"
