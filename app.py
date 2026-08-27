@@ -242,6 +242,13 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
+import time
+import json
+from PIL import Image
+import streamlit as st
+from google import genai
+from google.genai import types
+
 def run_gemini_parser(img: Image.Image, key: str) -> dict:
     if not key:
         res = DEFAULT_DWC_RECORD.copy()
@@ -255,11 +262,11 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         client = genai.Client(api_key=key)
         
-        # Priority model list (Main -> Fallbacks)
+        # Updated active models (removing retired/deprecated model strings)
         candidate_models = [
-            "gemini-3.7-flash",
             "gemini-3.6-flash",
-            "gemini-2.5-flash",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash",
         ]
 
         prompt = """
@@ -321,7 +328,6 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
 
         last_error = None
         for model_name in candidate_models:
-            # Try up to 3 retries per model with exponential backoff for transient 503/429 errors
             for attempt in range(3):
                 try:
                     response = client.models.generate_content(
@@ -347,12 +353,15 @@ def run_gemini_parser(img: Image.Image, key: str) -> dict:
                 except Exception as err:
                     last_error = err
                     err_str = str(err)
-                    # If server is unavailable (503) or rate-limited (429), pause and retry
+                    
+                    # Retry transient 503/429 server backpressure errors
                     if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
                         time.sleep((2 ** attempt) + 0.5)
                         continue
+                    # Immediately skip deprecated 404 models without retrying
+                    elif any(code in err_str for code in ["404", "NOT_FOUND"]):
+                        break
                     else:
-                        # Non-transient error (e.g., model deprecation or bad request), move to next model
                         break
 
         if last_error:
