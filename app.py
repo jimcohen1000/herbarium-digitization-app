@@ -70,6 +70,8 @@ if "idx" not in st.session_state:
     st.session_state.idx = 0
 if "page_data" not in st.session_state:
     st.session_state.page_data = {}
+if "barcode_cache" not in st.session_state:
+    st.session_state.barcode_cache = {}
 if "image_paths" not in st.session_state:
     st.session_state.image_paths = []
 if "work_dir" not in st.session_state:
@@ -477,27 +479,55 @@ uploaded_files = st.sidebar.file_uploader(
     accept_multiple_files=True,
 )
 
-if uploaded_files and not st.session_state.image_paths:
-    for uploaded_file in uploaded_files:
-        if uploaded_file.name.lower().endswith(".zip"):
-            with zipfile.ZipFile(uploaded_file, "r") as zip_ref:
-                zip_ref.extractall(st.session_state.work_dir)
-        else:
-            file_path = os.path.join(
-                st.session_state.work_dir, uploaded_file.name
-            )
-            with open(file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+if "processed_upload_names" not in st.session_state:
+    st.session_state.processed_upload_names = set()
 
-    valid_exts = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
-    paths = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(st.session_state.work_dir)
-        for f in files
-        if f.lower().endswith(valid_exts)
-    ]
-    st.session_state.image_paths = sorted(paths)
-    st.rerun()
+# Only extract/copy files we haven't seen before, so uploading an
+# additional batch (or forgotten specimens) later in the same session
+# APPENDS to the existing image list instead of being silently ignored --
+# the old guard (`not st.session_state.image_paths`) only ever fired once.
+if uploaded_files:
+    new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_upload_names]
+    if new_files:
+        for uploaded_file in new_files:
+            st.session_state.processed_upload_names.add(uploaded_file.name)
+            if uploaded_file.name.lower().endswith(".zip"):
+                with zipfile.ZipFile(uploaded_file, "r") as zip_ref:
+                    zip_ref.extractall(st.session_state.work_dir)
+            else:
+                file_path = os.path.join(
+                    st.session_state.work_dir, uploaded_file.name
+                )
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+
+        valid_exts = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
+        all_paths = [
+            os.path.join(root, f)
+            for root, _, files in os.walk(st.session_state.work_dir)
+            for f in files
+            if f.lower().endswith(valid_exts)
+        ]
+        already_have = set(st.session_state.image_paths)
+        newly_added = [p for p in sorted(all_paths) if p not in already_have]
+        if newly_added:
+            st.session_state.image_paths.extend(newly_added)
+            st.rerun()
+
+with st.sidebar.expander("⚠️ Start New Batch (clears everything)"):
+    st.caption(
+        "Clears all uploaded images, saved records, and unsaved progress "
+        "for the current session. This cannot be undone -- make sure "
+        "you've exported your CSV first if you want to keep this batch's data."
+    )
+    confirm_reset = st.checkbox("I understand this clears all progress", key="confirm_reset")
+    if st.button("🗑️ Start New Batch", disabled=not confirm_reset):
+        for tmp_dir in (st.session_state.get("work_dir"), st.session_state.get("out_dir")):
+            if tmp_dir and os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
 # -----------------------------------------------------------------------------
 # 5. MAIN DIGITIZATION WORKSPACE
@@ -602,7 +632,14 @@ if st.session_state.image_paths:
                 st.divider()
 
             st.markdown("#### 1. Barcode Identification")
-            auto_code = decode_barcode_fullres(image)
+            # Cached per specimen (same pattern as page_data for the Gemini
+            # parse) -- decode_barcode_fullres is expensive enough (tries
+            # multiple rotations/binarizations/decode libraries) that
+            # recomputing it on every keystroke elsewhere in the form made
+            # typing noticeably laggy. Detection logic itself is unchanged.
+            if current_idx not in st.session_state.barcode_cache:
+                st.session_state.barcode_cache[current_idx] = decode_barcode_fullres(image)
+            auto_code = st.session_state.barcode_cache[current_idx]
             if not auto_code and pf.get("catalogNumber"):
                 auto_code = pf.get("catalogNumber")
 
@@ -885,7 +922,27 @@ if st.session_state.image_paths:
 
             st.divider()
 
-            if st.button("💾 Save Record & Next Specimen", type="primary"):
+            existing_cat_nums = {r.get("catalogNumber") for r in st.session_state.records}
+            is_duplicate_cat_num = bool(cat_num) and cat_num in existing_cat_nums
+            confirm_duplicate = True
+            if is_duplicate_cat_num:
+                st.warning(
+                    f"⚠️ Catalog Number '{cat_num}' is already used by a saved record in this "
+                    f"batch. Saving now will OVERWRITE that specimen's saved image file (its "
+                    f"row stays in the spreadsheet, but its image will be replaced). This "
+                    f"usually means a barcode misread -- double-check the Catalog Number field "
+                    f"above before proceeding."
+                )
+                confirm_duplicate = st.checkbox(
+                    "I've checked the Catalog Number and confirm this duplicate is intentional.",
+                    key=f"confirm_dup_{current_idx}_{ver}",
+                )
+
+            if st.button(
+                "💾 Save Record & Next Specimen",
+                type="primary",
+                disabled=is_duplicate_cat_num and not confirm_duplicate,
+            ):
                 if not cat_num:
                     st.session_state.last_error = "Catalog Number (Barcode) is required before saving."
                     st.rerun()
